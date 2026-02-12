@@ -1,0 +1,4 @@
+*.hjp
+*.o
+*.dSYM/
+.DS_Store

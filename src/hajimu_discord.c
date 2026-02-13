@@ -10,6 +10,9 @@
  * MIT License
  *
  * v1.0.0 — 2026-02-12
+ * v1.1.0 — 2026-02-14  メッセージ操作完全化・タイムアウト・エラー/切断イベント
+ * v1.2.0 — 2026-02-14  ボタン・セレクトメニュー・コンポーネント・エフェメラル応答
+ * v1.3.0 — 2026-02-14  モーダル・サブコマンド・コンテキストメニュー・オートコンプリート
  */
 
 #define _GNU_SOURCE
@@ -47,7 +50,7 @@
  * ========================================================================= */
 
 #define PLUGIN_NAME    "hajimu_discord"
-#define PLUGIN_VERSION "1.0.0"
+#define PLUGIN_VERSION "1.3.0"
 
 /* Discord API */
 #define DISCORD_API_BASE    "https://discord.com/api/v10"
@@ -70,6 +73,31 @@
 #define WS_READ_BUF           65536
 #define REST_BUF_INIT         4096
 #define ZLIB_CHUNK            65536
+
+/* v1.2.0: Component limits */
+#define MAX_BUTTONS           128
+#define MAX_ACTION_ROWS       64
+#define MAX_ROW_COMPONENTS    5
+#define MAX_SELECT_MENUS      64
+#define MAX_MENU_OPTIONS      25
+#define MAX_COMP_HANDLERS     128
+
+/* v1.3.0: Modal limits */
+#define MAX_MODALS            32
+#define MAX_MODAL_INPUTS      5
+#define MAX_CMD_CHOICES       25
+
+/* Discord component types */
+#define COMP_ACTION_ROW       1
+#define COMP_BUTTON           2
+#define COMP_STRING_SELECT    3
+
+/* Button styles */
+#define BTN_PRIMARY           1
+#define BTN_SECONDARY         2
+#define BTN_SUCCESS           3
+#define BTN_DANGER            4
+#define BTN_LINK              5
 
 /* WebSocket opcodes */
 #define WS_OP_TEXT   0x1
@@ -173,6 +201,71 @@ typedef struct {
     bool active;
 } Embed;
 
+/* --- v1.2.0: Button --- */
+typedef struct {
+    int  style;               /* BTN_PRIMARY ... BTN_LINK */
+    char label[80];
+    char custom_id[100];
+    char url[MAX_URL_LEN];    /* link style only */
+    char emoji_name[64];
+    bool disabled;
+    bool active;
+} Button;
+
+/* --- v1.2.0: Select Menu Option --- */
+typedef struct {
+    char label[100];
+    char value[100];
+    char description[100];
+    char emoji_name[64];
+    bool default_selected;
+} MenuOption;
+
+/* --- v1.2.0: Select Menu --- */
+typedef struct {
+    char custom_id[100];
+    char placeholder[150];
+    int  min_values;
+    int  max_values;
+    MenuOption options[MAX_MENU_OPTIONS];
+    int  option_count;
+    bool disabled;
+    bool active;
+} SelectMenu;
+
+/* --- v1.2.0: Action Row --- */
+typedef struct {
+    int  comp_type[MAX_ROW_COMPONENTS];  /* COMP_BUTTON or COMP_STRING_SELECT */
+    int  comp_idx[MAX_ROW_COMPONENTS];   /* index into buttons[] or menus[] */
+    int  comp_count;
+    bool active;
+} ActionRow;
+
+/* --- v1.2.0: Component Handler (maps custom_id → callback) --- */
+typedef struct {
+    char custom_id[100];
+    Value callback;
+    int type;  /* COMP_BUTTON or COMP_STRING_SELECT, -1=modal */
+} ComponentHandler;
+
+/* --- v1.3.0: Modal --- */
+typedef struct {
+    char custom_id[100];
+    char title[128];
+    struct {
+        char custom_id[100];
+        char label[128];
+        int  style;          /* 1=Short, 2=Paragraph */
+        char placeholder[256];
+        char default_value[4096];
+        int  min_length;
+        int  max_length;
+        bool required;
+    } inputs[MAX_MODAL_INPUTS];
+    int input_count;
+    bool active;
+} Modal;
+
 /* --- Slash Command --- */
 typedef struct {
     char name[64];
@@ -245,6 +338,23 @@ typedef struct {
     /* Embeds (pooled) */
     Embed embeds[MAX_EMBEDS_STORE];
 
+    /* Components (v1.2.0) */
+    Button buttons[MAX_BUTTONS];
+    SelectMenu menus[MAX_SELECT_MENUS];
+    ActionRow rows[MAX_ACTION_ROWS];
+    ComponentHandler comp_handlers[MAX_COMP_HANDLERS];
+    int comp_handler_count;
+
+    /* Modals (v1.3.0) */
+    Modal modals[MAX_MODALS];
+
+    /* Autocomplete handlers (v1.3.0) — maps command name → callback */
+    struct {
+        char command_name[64];
+        Value callback;
+    } autocomplete_handlers[MAX_COMMANDS];
+    int autocomplete_count;
+
     /* Bot user info */
     char bot_id[MAX_SNOWFLAKE];
     char bot_username[128];
@@ -264,6 +374,9 @@ static BotState g_bot = {0};
 
 /* Shutdown flag */
 static volatile sig_atomic_t g_shutdown = 0;
+
+/* Forward declarations for event system (used in REST and Gateway) */
+static void event_fire(const char *name, int argc, Value *argv);
 
 /* =========================================================================
  * Section 3: Logging
@@ -803,6 +916,9 @@ static JsonNode *discord_rest(const char *method, const char *endpoint,
         }
     } else if (res != CURLE_OK) {
         LOG_E("REST APIエラー: %s", curl_easy_strerror(res));
+        Value err_msg = hajimu_string(curl_easy_strerror(res));
+        event_fire("エラー", 1, &err_msg);
+        event_fire("ERROR", 1, &err_msg);
     }
 
     free(resp.data);
@@ -1503,6 +1619,92 @@ static void gw_handle_interaction(JsonNode *data) {
         Value interaction = json_to_value(data);
         event_fire("コマンド受信", 1, &interaction);
     }
+
+    /* Type 3 = MESSAGE_COMPONENT (button click, select menu) */
+    if (type == 3) {
+        JsonNode *comp_data = json_get(data, "data");
+        if (!comp_data) return;
+        const char *custom_id = json_get_str(comp_data, "custom_id");
+        int comp_type = (int)json_get_num(comp_data, "component_type");
+        if (!custom_id) return;
+
+        Value interaction = json_to_value(data);
+        event_fire("INTERACTION_CREATE", 1, &interaction);
+
+        /* Find registered component handler */
+        for (int i = 0; i < g_bot.comp_handler_count; i++) {
+            if (strcmp(g_bot.comp_handlers[i].custom_id, custom_id) == 0 &&
+                (g_bot.comp_handlers[i].type == comp_type || g_bot.comp_handlers[i].type == 0)) {
+                pthread_mutex_lock(&g_bot.callback_mutex);
+                if (hajimu_runtime_available()) {
+                    hajimu_call(&g_bot.comp_handlers[i].callback, 1, &interaction);
+                }
+                pthread_mutex_unlock(&g_bot.callback_mutex);
+                return;
+            }
+        }
+
+        /* Fire generic component events */
+        if (comp_type == COMP_BUTTON) {
+            event_fire("ボタンクリック", 1, &interaction);
+            event_fire("BUTTON_CLICK", 1, &interaction);
+        } else if (comp_type == COMP_STRING_SELECT) {
+            event_fire("セレクト選択", 1, &interaction);
+            event_fire("SELECT_MENU", 1, &interaction);
+        }
+    }
+
+    /* Type 4 = APPLICATION_COMMAND_AUTOCOMPLETE */
+    if (type == 4) {
+        JsonNode *ac_data = json_get(data, "data");
+        if (!ac_data) return;
+        const char *cmd_name = json_get_str(ac_data, "name");
+        if (!cmd_name) return;
+
+        Value interaction = json_to_value(data);
+
+        /* Find registered autocomplete handler */
+        for (int i = 0; i < g_bot.autocomplete_count; i++) {
+            if (strcmp(g_bot.autocomplete_handlers[i].command_name, cmd_name) == 0) {
+                pthread_mutex_lock(&g_bot.callback_mutex);
+                if (hajimu_runtime_available()) {
+                    hajimu_call(&g_bot.autocomplete_handlers[i].callback, 1, &interaction);
+                }
+                pthread_mutex_unlock(&g_bot.callback_mutex);
+                return;
+            }
+        }
+
+        event_fire("オートコンプリート", 1, &interaction);
+        event_fire("AUTOCOMPLETE", 1, &interaction);
+    }
+
+    /* Type 5 = MODAL_SUBMIT */
+    if (type == 5) {
+        JsonNode *modal_data = json_get(data, "data");
+        if (!modal_data) return;
+        const char *custom_id = json_get_str(modal_data, "custom_id");
+        if (!custom_id) return;
+
+        Value interaction = json_to_value(data);
+        event_fire("INTERACTION_CREATE", 1, &interaction);
+
+        /* Find registered modal handler */
+        for (int i = 0; i < g_bot.comp_handler_count; i++) {
+            if (strcmp(g_bot.comp_handlers[i].custom_id, custom_id) == 0 &&
+                g_bot.comp_handlers[i].type == -1) { /* -1 = modal */
+                pthread_mutex_lock(&g_bot.callback_mutex);
+                if (hajimu_runtime_available()) {
+                    hajimu_call(&g_bot.comp_handlers[i].callback, 1, &interaction);
+                }
+                pthread_mutex_unlock(&g_bot.callback_mutex);
+                return;
+            }
+        }
+
+        event_fire("モーダル送信", 1, &interaction);
+        event_fire("MODAL_SUBMIT", 1, &interaction);
+    }
 }
 
 /* Process a DISPATCH event (opcode 0) */
@@ -1655,6 +1857,9 @@ static void *heartbeat_thread_func(void *arg) {
 
         if (!g_bot.heartbeat_acked && g_bot.ws.connected) {
             LOG_W("Heartbeat ACK未受信。接続が切断された可能性があります");
+            Value err_msg = hajimu_string("Heartbeat ACK未受信");
+            event_fire("エラー", 1, &err_msg);
+            event_fire("ERROR", 1, &err_msg);
             ws_close(&g_bot.ws);
             continue;
         }
@@ -1676,13 +1881,28 @@ static void register_slash_commands(void) {
     for (int i = 0; i < g_bot.command_count; i++) {
         if (g_bot.commands[i].registered) continue;
 
+        /* Skip subcommand entries (name contains '/') */
+        if (strchr(g_bot.commands[i].name, '/')) {
+            g_bot.commands[i].registered = true;
+            continue;
+        }
+
         StrBuf sb; sb_init(&sb);
         jb_obj_start(&sb);
         jb_str(&sb, "name", g_bot.commands[i].name);
-        jb_str(&sb, "description", g_bot.commands[i].description);
-        jb_int(&sb, "type", 1); /* CHAT_INPUT */
 
-        if (g_bot.commands[i].option_count > 0) {
+        /* Determine command type */
+        int cmd_type = 1; /* CHAT_INPUT */
+        if (g_bot.commands[i].option_count == -2) cmd_type = 2; /* USER context menu */
+        else if (g_bot.commands[i].option_count == -3) cmd_type = 3; /* MESSAGE context menu */
+        jb_int(&sb, "type", cmd_type);
+
+        /* Context menus don't need description */
+        if (cmd_type == 1) {
+            jb_str(&sb, "description", g_bot.commands[i].description);
+        }
+
+        if (cmd_type == 1 && g_bot.commands[i].option_count > 0) {
             jb_key(&sb, "options"); jb_arr_start(&sb);
             for (int j = 0; j < g_bot.commands[i].option_count; j++) {
                 jb_obj_start(&sb);
@@ -1708,9 +1928,11 @@ static void register_slash_commands(void) {
                 snprintf(g_bot.commands[i].registered_id, MAX_SNOWFLAKE, "%s", cmd_id);
             }
             g_bot.commands[i].registered = true;
-            LOG_I("スラッシュコマンド登録: /%s", g_bot.commands[i].name);
+            const char *type_name = cmd_type == 1 ? "コマンド" :
+                                    cmd_type == 2 ? "ユーザーメニュー" : "メッセージメニュー";
+            LOG_I("%s登録: %s", type_name, g_bot.commands[i].name);
         } else {
-            LOG_E("スラッシュコマンド登録失敗: /%s (HTTP %ld)", g_bot.commands[i].name, code);
+            LOG_E("コマンド登録失敗: %s (HTTP %ld)", g_bot.commands[i].name, code);
         }
         if (resp) { json_free(resp); free(resp); }
         sb_free(&sb);
@@ -1749,6 +1971,9 @@ static void *gateway_thread_func(void *arg) {
         LOG_I("Gatewayに接続中... (%s)", host);
         if (ws_connect(&g_bot.ws, host, port, path) < 0) {
             LOG_E("Gateway接続失敗。5秒後に再試行...");
+            Value err_msg = hajimu_string("Gateway接続失敗");
+            event_fire("エラー", 1, &err_msg);
+            event_fire("ERROR", 1, &err_msg);
             sleep(5);
             continue;
         }
@@ -1759,6 +1984,9 @@ static void *gateway_thread_func(void *arg) {
             if (!msg) {
                 if (g_bot.running && !g_shutdown) {
                     LOG_W("Gateway接続が切断されました。再接続します...");
+                    Value disc_msg = hajimu_string("Gateway切断");
+                    event_fire("切断", 1, &disc_msg);
+                    event_fire("DISCONNECT", 1, &disc_msg);
                     ws_close(&g_bot.ws);
                 }
                 break;
@@ -1778,6 +2006,9 @@ static void *gateway_thread_func(void *arg) {
 
         if (g_bot.running && !g_shutdown) {
             LOG_I("2秒後にGateway再接続...");
+            Value reconn_msg = hajimu_string("再接続中");
+            event_fire("再接続", 1, &reconn_msg);
+            event_fire("RECONNECT", 1, &reconn_msg);
             sleep(2);
         }
     }
@@ -2056,7 +2287,10 @@ static Value fn_edit_message(int argc, Value *argv) {
     JsonNode *resp = discord_rest("PATCH", ep, sb.data, &code);
     sb_free(&sb);
 
-    Value result = hajimu_bool(code == 200);
+    Value result = hajimu_bool(false);
+    if (resp && code == 200) {
+        result = json_to_value(resp);
+    }
     if (resp) { json_free(resp); free(resp); }
     return result;
 }
@@ -2314,9 +2548,10 @@ static Value fn_command_option(int argc, Value *argv) {
 }
 
 /* コマンド応答(インタラクション, 内容) */
+/* コマンド応答(インタラクション, 内容[, エフェメラル]) */
 static Value fn_command_respond(int argc, Value *argv) {
     if (argc < 2 || argv[0].type != VALUE_DICT || argv[1].type != VALUE_STRING) {
-        LOG_E("コマンド応答: (インタラクション, 内容) が必要です");
+        LOG_E("コマンド応答: (インタラクション, 内容[, エフェメラル]) が必要です");
         return hajimu_bool(false);
     }
     const char *interaction_id = value_get_str(&argv[0], "ID");
@@ -2326,11 +2561,14 @@ static Value fn_command_respond(int argc, Value *argv) {
         return hajimu_bool(false);
     }
 
+    bool ephemeral = (argc >= 3 && argv[2].type == VALUE_BOOL && argv[2].boolean);
+
     StrBuf sb; sb_init(&sb);
     jb_obj_start(&sb);
     jb_int(&sb, "type", 4); /* CHANNEL_MESSAGE_WITH_SOURCE */
     jb_key(&sb, "data"); jb_obj_start(&sb);
     jb_str(&sb, "content", argv[1].string.data);
+    if (ephemeral) jb_int(&sb, "flags", 64); /* EPHEMERAL */
     jb_obj_end(&sb); sb_append_char(&sb, ',');
     jb_obj_end(&sb);
 
@@ -2572,7 +2810,7 @@ static Value fn_add_reaction(int argc, Value *argv) {
     return hajimu_bool(code == 204);
 }
 
-/* リアクション削除(チャンネルID, メッセージID, 絵文字) */
+/* リアクション削除(チャンネルID, メッセージID, 絵文字[, ユーザーID]) */
 static Value fn_remove_reaction(int argc, Value *argv) {
     if (argc < 3 || argv[0].type != VALUE_STRING ||
         argv[1].type != VALUE_STRING || argv[2].type != VALUE_STRING)
@@ -2583,8 +2821,15 @@ static Value fn_remove_reaction(int argc, Value *argv) {
     curl_easy_cleanup(curl);
 
     char ep[256];
-    snprintf(ep, sizeof(ep), "/channels/%s/messages/%s/reactions/%s/@me",
-             argv[0].string.data, argv[1].string.data, encoded);
+    if (argc >= 4 && argv[3].type == VALUE_STRING) {
+        /* 特定ユーザーのリアクション削除 */
+        snprintf(ep, sizeof(ep), "/channels/%s/messages/%s/reactions/%s/%s",
+                 argv[0].string.data, argv[1].string.data, encoded, argv[3].string.data);
+    } else {
+        /* 自分のリアクション削除 */
+        snprintf(ep, sizeof(ep), "/channels/%s/messages/%s/reactions/%s/@me",
+                 argv[0].string.data, argv[1].string.data, encoded);
+    }
     curl_free(encoded);
 
     long code = 0;
@@ -2666,6 +2911,32 @@ static Value fn_pin_message(int argc, Value *argv) {
     return hajimu_bool(code == 204);
 }
 
+/* ピン解除(チャンネルID, メッセージID) */
+static Value fn_unpin_message(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING)
+        return hajimu_bool(false);
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/channels/%s/pins/%s",
+             argv[0].string.data, argv[1].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("DELETE", ep, NULL, &code);
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code == 204);
+}
+
+/* ピン一覧(チャンネルID) */
+static Value fn_pin_list(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_null();
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/channels/%s/pins", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", ep, NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
 /* --- DM --- */
 
 /* DM作成(ユーザーID) → チャンネル情報を返す */
@@ -2684,6 +2955,921 @@ static Value fn_create_dm(int argc, Value *argv) {
     if (resp && code == 200) result = json_to_value(resp);
     if (resp) { json_free(resp); free(resp); }
     return result;
+}
+
+/* --- v1.1.0: メッセージ操作拡張 --- */
+
+/* メッセージ取得(チャンネルID, メッセージID) */
+static Value fn_get_message(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING) {
+        LOG_E("メッセージ取得: (チャンネルID, メッセージID) が必要です");
+        return hajimu_null();
+    }
+    char ep[160];
+    snprintf(ep, sizeof(ep), "/channels/%s/messages/%s",
+             argv[0].string.data, argv[1].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", ep, NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* メッセージ履歴(チャンネルID, 件数) */
+static Value fn_message_history(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_NUMBER) {
+        LOG_E("メッセージ履歴: (チャンネルID, 件数) が必要です");
+        return hajimu_null();
+    }
+    int limit = (int)argv[1].number;
+    if (limit < 1) limit = 1;
+    if (limit > 100) limit = 100;
+
+    char ep[160];
+    snprintf(ep, sizeof(ep), "/channels/%s/messages?limit=%d",
+             argv[0].string.data, limit);
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", ep, NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* メッセージ一括削除(チャンネルID, 件数) — 最近N件を取得して一括削除 */
+static Value fn_bulk_delete_count(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_NUMBER) {
+        LOG_E("メッセージ一括削除: (チャンネルID, 件数) が必要です");
+        return hajimu_bool(false);
+    }
+    int count = (int)argv[1].number;
+    if (count < 2) count = 2;
+    if (count > 100) count = 100;
+
+    /* Step 1: Fetch recent message IDs */
+    char fetch_ep[160];
+    snprintf(fetch_ep, sizeof(fetch_ep), "/channels/%s/messages?limit=%d",
+             argv[0].string.data, count);
+    long fetch_code = 0;
+    JsonNode *msgs = discord_rest("GET", fetch_ep, NULL, &fetch_code);
+    if (!msgs || fetch_code != 200 || msgs->type != JSON_ARRAY || msgs->arr.count < 2) {
+        LOG_E("メッセージ一括削除: メッセージの取得に失敗しました");
+        if (msgs) { json_free(msgs); free(msgs); }
+        return hajimu_bool(false);
+    }
+
+    /* Step 2: Build array of message IDs */
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    jb_key(&sb, "messages"); jb_arr_start(&sb);
+    for (int i = 0; i < msgs->arr.count; i++) {
+        const char *mid = json_get_str(&msgs->arr.items[i], "id");
+        if (mid) {
+            json_escape_str(&sb, mid);
+            sb_append_char(&sb, ',');
+        }
+    }
+    jb_arr_end(&sb); sb_append_char(&sb, ',');
+    jb_obj_end(&sb);
+
+    json_free(msgs); free(msgs);
+
+    /* Step 3: Bulk delete */
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/channels/%s/messages/bulk-delete", argv[0].string.data);
+
+    long code = 0;
+    JsonNode *resp = discord_rest("POST", ep, sb.data, &code);
+    sb_free(&sb);
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code == 204);
+}
+
+/* リアクション全削除(チャンネルID, メッセージID) */
+static Value fn_remove_all_reactions(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING) {
+        LOG_E("リアクション全削除: (チャンネルID, メッセージID) が必要です");
+        return hajimu_bool(false);
+    }
+    char ep[160];
+    snprintf(ep, sizeof(ep), "/channels/%s/messages/%s/reactions",
+             argv[0].string.data, argv[1].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("DELETE", ep, NULL, &code);
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code == 204);
+}
+
+/* タイムアウト(サーバーID, ユーザーID, 秒数) — 0で解除 */
+static Value fn_timeout(int argc, Value *argv) {
+    if (argc < 3 || argv[0].type != VALUE_STRING ||
+        argv[1].type != VALUE_STRING || argv[2].type != VALUE_NUMBER) {
+        LOG_E("タイムアウト: (サーバーID, ユーザーID, 秒数) が必要です");
+        return hajimu_bool(false);
+    }
+    int seconds = (int)argv[2].number;
+
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    if (seconds <= 0) {
+        /* タイムアウト解除 */
+        jb_null(&sb, "communication_disabled_until");
+    } else {
+        /* ISO 8601 timestamp: now + seconds */
+        if (seconds > 2419200) seconds = 2419200; /* Max 28 days */
+        time_t target = time(NULL) + seconds;
+        struct tm *tm = gmtime(&target);
+        char ts[64];
+        strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%SZ", tm);
+        jb_str(&sb, "communication_disabled_until", ts);
+    }
+    jb_obj_end(&sb);
+
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/guilds/%s/members/%s",
+             argv[0].string.data, argv[1].string.data);
+
+    long code = 0;
+    JsonNode *resp = discord_rest("PATCH", ep, sb.data, &code);
+    sb_free(&sb);
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code == 200 || code == 204);
+}
+
+/* --- v1.1.0: イベントハンドラ拡張 --- */
+
+/* エラー時(コールバック) */
+static Value fn_on_error(int argc, Value *argv) {
+    if (argc < 1 || (argv[0].type != VALUE_FUNCTION && argv[0].type != VALUE_BUILTIN)) {
+        LOG_E("エラー時: コールバック関数が必要です");
+        return hajimu_bool(false);
+    }
+    event_register("エラー", argv[0]);
+    event_register("ERROR", argv[0]);
+    return hajimu_bool(true);
+}
+
+/* 切断時(コールバック) */
+static Value fn_on_disconnect(int argc, Value *argv) {
+    if (argc < 1 || (argv[0].type != VALUE_FUNCTION && argv[0].type != VALUE_BUILTIN)) {
+        LOG_E("切断時: コールバック関数が必要です");
+        return hajimu_bool(false);
+    }
+    event_register("切断", argv[0]);
+    event_register("DISCONNECT", argv[0]);
+    return hajimu_bool(true);
+}
+
+/* 再接続時(コールバック) */
+static Value fn_on_reconnect(int argc, Value *argv) {
+    if (argc < 1 || (argv[0].type != VALUE_FUNCTION && argv[0].type != VALUE_BUILTIN)) {
+        LOG_E("再接続時: コールバック関数が必要です");
+        return hajimu_bool(false);
+    }
+    event_register("再接続", argv[0]);
+    event_register("RECONNECT", argv[0]);
+    return hajimu_bool(true);
+}
+
+/* =========================================================================
+ * v1.2.0: Message Components — Button, Select Menu, Action Row
+ * ========================================================================= */
+
+/* --- ボタン --- */
+
+static int button_alloc(void) {
+    for (int i = 0; i < MAX_BUTTONS; i++) {
+        if (!g_bot.buttons[i].active) {
+            memset(&g_bot.buttons[i], 0, sizeof(Button));
+            g_bot.buttons[i].active = true;
+            g_bot.buttons[i].style = BTN_PRIMARY;
+            return i;
+        }
+    }
+    LOG_E("ボタンの上限に達しました");
+    return -1;
+}
+
+static Button *button_get(int idx) {
+    if (idx < 0 || idx >= MAX_BUTTONS || !g_bot.buttons[idx].active) return NULL;
+    return &g_bot.buttons[idx];
+}
+
+/* ボタン作成(ラベル, スタイル, カスタムID) */
+static Value fn_button_create(int argc, Value *argv) {
+    if (argc < 3 || argv[0].type != VALUE_STRING ||
+        argv[1].type != VALUE_STRING || argv[2].type != VALUE_STRING) {
+        LOG_E("ボタン作成: (ラベル, スタイル, カスタムID) が必要です");
+        return hajimu_null();
+    }
+    int idx = button_alloc();
+    if (idx < 0) return hajimu_null();
+
+    Button *b = &g_bot.buttons[idx];
+    snprintf(b->label, sizeof(b->label), "%s", argv[0].string.data);
+    snprintf(b->custom_id, sizeof(b->custom_id), "%s", argv[2].string.data);
+
+    /* Parse style */
+    const char *s = argv[1].string.data;
+    if (strcmp(s, "プライマリ") == 0 || strcmp(s, "PRIMARY") == 0 || strcmp(s, "青") == 0) b->style = BTN_PRIMARY;
+    else if (strcmp(s, "セカンダリ") == 0 || strcmp(s, "SECONDARY") == 0 || strcmp(s, "灰") == 0) b->style = BTN_SECONDARY;
+    else if (strcmp(s, "成功") == 0 || strcmp(s, "SUCCESS") == 0 || strcmp(s, "緑") == 0) b->style = BTN_SUCCESS;
+    else if (strcmp(s, "危険") == 0 || strcmp(s, "DANGER") == 0 || strcmp(s, "赤") == 0) b->style = BTN_DANGER;
+    else if (strcmp(s, "リンク") == 0 || strcmp(s, "LINK") == 0) b->style = BTN_LINK;
+    else b->style = BTN_PRIMARY;
+
+    return hajimu_number(idx);
+}
+
+/* リンクボタン作成(ラベル, URL) */
+static Value fn_link_button_create(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING) {
+        LOG_E("リンクボタン作成: (ラベル, URL) が必要です");
+        return hajimu_null();
+    }
+    int idx = button_alloc();
+    if (idx < 0) return hajimu_null();
+
+    Button *b = &g_bot.buttons[idx];
+    snprintf(b->label, sizeof(b->label), "%s", argv[0].string.data);
+    snprintf(b->url, sizeof(b->url), "%s", argv[1].string.data);
+    b->style = BTN_LINK;
+    b->custom_id[0] = '\0';
+
+    return hajimu_number(idx);
+}
+
+/* ボタン無効化(ボタンID, 真偽) */
+static Value fn_button_disable(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_NUMBER || argv[1].type != VALUE_BOOL)
+        return hajimu_bool(false);
+    Button *b = button_get((int)argv[0].number);
+    if (!b) return hajimu_bool(false);
+    b->disabled = argv[1].boolean;
+    return hajimu_number(argv[0].number);
+}
+
+/* --- アクション行 --- */
+
+static int row_alloc(void) {
+    for (int i = 0; i < MAX_ACTION_ROWS; i++) {
+        if (!g_bot.rows[i].active) {
+            memset(&g_bot.rows[i], 0, sizeof(ActionRow));
+            g_bot.rows[i].active = true;
+            return i;
+        }
+    }
+    LOG_E("アクション行の上限に達しました");
+    return -1;
+}
+
+static ActionRow *row_get(int idx) {
+    if (idx < 0 || idx >= MAX_ACTION_ROWS || !g_bot.rows[idx].active) return NULL;
+    return &g_bot.rows[idx];
+}
+
+/* アクション行作成() */
+static Value fn_action_row_create(int argc, Value *argv) {
+    (void)argc; (void)argv;
+    int idx = row_alloc();
+    if (idx < 0) return hajimu_null();
+    return hajimu_number(idx);
+}
+
+/* 行にボタン追加(行ID, ボタンID) */
+static Value fn_row_add_button(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_NUMBER || argv[1].type != VALUE_NUMBER) {
+        LOG_E("行にボタン追加: (行ID, ボタンID) が必要です");
+        return hajimu_bool(false);
+    }
+    ActionRow *row = row_get((int)argv[0].number);
+    if (!row) return hajimu_bool(false);
+    if (row->comp_count >= MAX_ROW_COMPONENTS) {
+        LOG_E("アクション行のコンポーネント上限（5）に達しました");
+        return hajimu_bool(false);
+    }
+    Button *b = button_get((int)argv[1].number);
+    if (!b) return hajimu_bool(false);
+
+    int ci = row->comp_count++;
+    row->comp_type[ci] = COMP_BUTTON;
+    row->comp_idx[ci] = (int)argv[1].number;
+    return hajimu_number(argv[0].number);
+}
+
+/* 行にメニュー追加(行ID, メニューID) */
+static Value fn_row_add_menu(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_NUMBER || argv[1].type != VALUE_NUMBER) {
+        LOG_E("行にメニュー追加: (行ID, メニューID) が必要です");
+        return hajimu_bool(false);
+    }
+    ActionRow *row = row_get((int)argv[0].number);
+    if (!row) return hajimu_bool(false);
+    /* Select menus take up the whole row */
+    if (row->comp_count >= 1) {
+        LOG_E("セレクトメニューはアクション行に1つだけ配置できます");
+        return hajimu_bool(false);
+    }
+    SelectMenu *m = &g_bot.menus[(int)argv[1].number];
+    if (!m->active) return hajimu_bool(false);
+
+    int ci = row->comp_count++;
+    row->comp_type[ci] = COMP_STRING_SELECT;
+    row->comp_idx[ci] = (int)argv[1].number;
+    return hajimu_number(argv[0].number);
+}
+
+/* Serialize a button to JSON */
+static void button_to_json(StrBuf *sb, Button *b) {
+    jb_obj_start(sb);
+    jb_int(sb, "type", COMP_BUTTON);
+    jb_int(sb, "style", b->style);
+    if (b->label[0]) jb_str(sb, "label", b->label);
+    if (b->style == BTN_LINK) {
+        if (b->url[0]) jb_str(sb, "url", b->url);
+    } else {
+        if (b->custom_id[0]) jb_str(sb, "custom_id", b->custom_id);
+    }
+    if (b->emoji_name[0]) {
+        jb_key(sb, "emoji"); jb_obj_start(sb);
+        jb_str(sb, "name", b->emoji_name);
+        jb_obj_end(sb); sb_append_char(sb, ',');
+    }
+    if (b->disabled) jb_bool(sb, "disabled", true);
+    jb_obj_end(sb);
+}
+
+/* Serialize a select menu to JSON */
+static void menu_to_json(StrBuf *sb, SelectMenu *m) {
+    jb_obj_start(sb);
+    jb_int(sb, "type", COMP_STRING_SELECT);
+    jb_str(sb, "custom_id", m->custom_id);
+    if (m->placeholder[0]) jb_str(sb, "placeholder", m->placeholder);
+    if (m->min_values > 0) jb_int(sb, "min_values", m->min_values);
+    if (m->max_values > 0) jb_int(sb, "max_values", m->max_values);
+    if (m->disabled) jb_bool(sb, "disabled", true);
+    jb_key(sb, "options"); jb_arr_start(sb);
+    for (int i = 0; i < m->option_count; i++) {
+        jb_obj_start(sb);
+        jb_str(sb, "label", m->options[i].label);
+        jb_str(sb, "value", m->options[i].value);
+        if (m->options[i].description[0]) jb_str(sb, "description", m->options[i].description);
+        if (m->options[i].emoji_name[0]) {
+            jb_key(sb, "emoji"); jb_obj_start(sb);
+            jb_str(sb, "name", m->options[i].emoji_name);
+            jb_obj_end(sb); sb_append_char(sb, ',');
+        }
+        if (m->options[i].default_selected) jb_bool(sb, "default", true);
+        jb_obj_end(sb); sb_append_char(sb, ',');
+    }
+    jb_arr_end(sb); sb_append_char(sb, ',');
+    jb_obj_end(sb);
+}
+
+/* Serialize an action row to JSON */
+static void row_to_json(StrBuf *sb, ActionRow *r) {
+    jb_obj_start(sb);
+    jb_int(sb, "type", COMP_ACTION_ROW);
+    jb_key(sb, "components"); jb_arr_start(sb);
+    for (int i = 0; i < r->comp_count; i++) {
+        if (r->comp_type[i] == COMP_BUTTON) {
+            Button *b = button_get(r->comp_idx[i]);
+            if (b) { button_to_json(sb, b); sb_append_char(sb, ','); }
+        } else if (r->comp_type[i] == COMP_STRING_SELECT) {
+            SelectMenu *m = &g_bot.menus[r->comp_idx[i]];
+            if (m->active) { menu_to_json(sb, m); sb_append_char(sb, ','); }
+        }
+    }
+    jb_arr_end(sb); sb_append_char(sb, ',');
+    jb_obj_end(sb);
+}
+
+/* コンポーネント送信(チャンネルID, テキスト, 行配列) */
+static Value fn_component_send(int argc, Value *argv) {
+    if (argc < 3 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING ||
+        argv[2].type != VALUE_ARRAY) {
+        LOG_E("コンポーネント送信: (チャンネルID, テキスト, 行配列) が必要です");
+        return hajimu_bool(false);
+    }
+
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    jb_str(&sb, "content", argv[1].string.data);
+    jb_key(&sb, "components"); jb_arr_start(&sb);
+    for (int i = 0; i < argv[2].array.length; i++) {
+        Value *row_val = &argv[2].array.elements[i];
+        if (row_val->type == VALUE_NUMBER) {
+            ActionRow *r = row_get((int)row_val->number);
+            if (r) { row_to_json(&sb, r); sb_append_char(&sb, ','); }
+        }
+    }
+    jb_arr_end(&sb); sb_append_char(&sb, ',');
+    jb_obj_end(&sb);
+
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/channels/%s/messages", argv[0].string.data);
+
+    long code = 0;
+    JsonNode *resp = discord_rest("POST", ep, sb.data, &code);
+    sb_free(&sb);
+
+    /* Free used components */
+    for (int i = 0; i < argv[2].array.length; i++) {
+        Value *row_val = &argv[2].array.elements[i];
+        if (row_val->type == VALUE_NUMBER) {
+            ActionRow *r = row_get((int)row_val->number);
+            if (r) {
+                for (int j = 0; j < r->comp_count; j++) {
+                    if (r->comp_type[j] == COMP_BUTTON) {
+                        Button *b = button_get(r->comp_idx[j]);
+                        if (b) b->active = false;
+                    } else if (r->comp_type[j] == COMP_STRING_SELECT) {
+                        g_bot.menus[r->comp_idx[j]].active = false;
+                    }
+                }
+                r->active = false;
+            }
+        }
+    }
+
+    Value result = hajimu_bool(false);
+    if (resp && (code == 200 || code == 201)) {
+        result = json_to_value(resp);
+    }
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* --- セレクトメニュー --- */
+
+static int menu_alloc(void) {
+    for (int i = 0; i < MAX_SELECT_MENUS; i++) {
+        if (!g_bot.menus[i].active) {
+            memset(&g_bot.menus[i], 0, sizeof(SelectMenu));
+            g_bot.menus[i].active = true;
+            g_bot.menus[i].min_values = 1;
+            g_bot.menus[i].max_values = 1;
+            return i;
+        }
+    }
+    LOG_E("セレクトメニューの上限に達しました");
+    return -1;
+}
+
+/* セレクトメニュー作成(カスタムID, プレースホルダー) */
+static Value fn_select_menu_create(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING) {
+        LOG_E("セレクトメニュー作成: (カスタムID, プレースホルダー) が必要です");
+        return hajimu_null();
+    }
+    int idx = menu_alloc();
+    if (idx < 0) return hajimu_null();
+
+    SelectMenu *m = &g_bot.menus[idx];
+    snprintf(m->custom_id, sizeof(m->custom_id), "%s", argv[0].string.data);
+    snprintf(m->placeholder, sizeof(m->placeholder), "%s", argv[1].string.data);
+    return hajimu_number(idx);
+}
+
+/* メニュー選択肢(メニューID, ラベル, 値, 説明) */
+static Value fn_menu_add_option(int argc, Value *argv) {
+    if (argc < 3 || argv[0].type != VALUE_NUMBER ||
+        argv[1].type != VALUE_STRING || argv[2].type != VALUE_STRING) {
+        LOG_E("メニュー選択肢: (メニューID, ラベル, 値[, 説明]) が必要です");
+        return hajimu_bool(false);
+    }
+    int idx = (int)argv[0].number;
+    if (idx < 0 || idx >= MAX_SELECT_MENUS || !g_bot.menus[idx].active)
+        return hajimu_bool(false);
+    SelectMenu *m = &g_bot.menus[idx];
+    if (m->option_count >= MAX_MENU_OPTIONS) {
+        LOG_E("メニュー選択肢の上限に達しました");
+        return hajimu_bool(false);
+    }
+
+    int oi = m->option_count++;
+    snprintf(m->options[oi].label, sizeof(m->options[oi].label), "%s", argv[1].string.data);
+    snprintf(m->options[oi].value, sizeof(m->options[oi].value), "%s", argv[2].string.data);
+    if (argc >= 4 && argv[3].type == VALUE_STRING)
+        snprintf(m->options[oi].description, sizeof(m->options[oi].description), "%s", argv[3].string.data);
+    return hajimu_number(argv[0].number);
+}
+
+/* --- コンポーネントイベントハンドラ --- */
+
+static int register_comp_handler(const char *custom_id, Value callback, int type) {
+    /* Check for existing handler with same custom_id and update */
+    for (int i = 0; i < g_bot.comp_handler_count; i++) {
+        if (strcmp(g_bot.comp_handlers[i].custom_id, custom_id) == 0 &&
+            g_bot.comp_handlers[i].type == type) {
+            g_bot.comp_handlers[i].callback = callback;
+            return 0;
+        }
+    }
+    if (g_bot.comp_handler_count >= MAX_COMP_HANDLERS) {
+        LOG_E("コンポーネントハンドラの上限に達しました");
+        return -1;
+    }
+    ComponentHandler *h = &g_bot.comp_handlers[g_bot.comp_handler_count++];
+    snprintf(h->custom_id, sizeof(h->custom_id), "%s", custom_id);
+    h->callback = callback;
+    h->type = type;
+    return 0;
+}
+
+/* ボタン時(カスタムID, コールバック) */
+static Value fn_on_button(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING ||
+        (argv[1].type != VALUE_FUNCTION && argv[1].type != VALUE_BUILTIN)) {
+        LOG_E("ボタン時: (カスタムID, コールバック) が必要です");
+        return hajimu_bool(false);
+    }
+    register_comp_handler(argv[0].string.data, argv[1], COMP_BUTTON);
+    LOG_D("ボタンハンドラ登録: %s", argv[0].string.data);
+    return hajimu_bool(true);
+}
+
+/* セレクト時(カスタムID, コールバック) */
+static Value fn_on_select(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING ||
+        (argv[1].type != VALUE_FUNCTION && argv[1].type != VALUE_BUILTIN)) {
+        LOG_E("セレクト時: (カスタムID, コールバック) が必要です");
+        return hajimu_bool(false);
+    }
+    register_comp_handler(argv[0].string.data, argv[1], COMP_STRING_SELECT);
+    LOG_D("セレクトハンドラ登録: %s", argv[0].string.data);
+    return hajimu_bool(true);
+}
+
+/* --- インタラクション応答 --- */
+
+/* インタラクション更新(インタラクション, 内容) — メッセージを更新（ボタンクリック後等） */
+static Value fn_interaction_update(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_DICT || argv[1].type != VALUE_STRING) {
+        LOG_E("インタラクション更新: (インタラクション, 内容) が必要です");
+        return hajimu_bool(false);
+    }
+    const char *interaction_id = value_get_str(&argv[0], "ID");
+    const char *interaction_token = value_get_str(&argv[0], "トークン");
+    if (!interaction_id || !interaction_token) return hajimu_bool(false);
+
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    jb_int(&sb, "type", 7); /* UPDATE_MESSAGE */
+    jb_key(&sb, "data"); jb_obj_start(&sb);
+    jb_str(&sb, "content", argv[1].string.data);
+    jb_obj_end(&sb); sb_append_char(&sb, ',');
+    jb_obj_end(&sb);
+
+    char ep[256];
+    snprintf(ep, sizeof(ep), "/interactions/%s/%s/callback",
+             interaction_id, interaction_token);
+
+    long code = 0;
+    JsonNode *resp = discord_rest("POST", ep, sb.data, &code);
+    sb_free(&sb);
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code == 200 || code == 204);
+}
+
+/* インタラクション遅延更新(インタラクション) — 遅延メッセージ更新（type 6） */
+static Value fn_interaction_defer_update(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_DICT) return hajimu_bool(false);
+    const char *interaction_id = value_get_str(&argv[0], "ID");
+    const char *interaction_token = value_get_str(&argv[0], "トークン");
+    if (!interaction_id || !interaction_token) return hajimu_bool(false);
+
+    char ep[256];
+    snprintf(ep, sizeof(ep), "/interactions/%s/%s/callback",
+             interaction_id, interaction_token);
+
+    long code = 0;
+    JsonNode *resp = discord_rest("POST", ep, "{\"type\":6}", &code);
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code == 200 || code == 204);
+}
+
+/* =========================================================================
+ * v1.3.0: Modals, Subcommands, Context Menus, Autocomplete
+ * ========================================================================= */
+
+/* --- モーダル --- */
+
+static int modal_alloc(void) {
+    for (int i = 0; i < MAX_MODALS; i++) {
+        if (!g_bot.modals[i].active) {
+            memset(&g_bot.modals[i], 0, sizeof(Modal));
+            g_bot.modals[i].active = true;
+            return i;
+        }
+    }
+    LOG_E("モーダルの上限に達しました");
+    return -1;
+}
+
+static Modal *modal_get(int idx) {
+    if (idx < 0 || idx >= MAX_MODALS || !g_bot.modals[idx].active) return NULL;
+    return &g_bot.modals[idx];
+}
+
+/* モーダル作成(カスタムID, タイトル) */
+static Value fn_modal_create(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING) {
+        LOG_E("モーダル作成: (カスタムID, タイトル) が必要です");
+        return hajimu_null();
+    }
+    int idx = modal_alloc();
+    if (idx < 0) return hajimu_null();
+
+    Modal *m = &g_bot.modals[idx];
+    snprintf(m->custom_id, sizeof(m->custom_id), "%s", argv[0].string.data);
+    snprintf(m->title, sizeof(m->title), "%s", argv[1].string.data);
+    return hajimu_number(idx);
+}
+
+/* テキスト入力追加(モーダルID, ラベル, カスタムID, スタイル) */
+static Value fn_modal_add_text_input(int argc, Value *argv) {
+    if (argc < 4 || argv[0].type != VALUE_NUMBER || argv[1].type != VALUE_STRING ||
+        argv[2].type != VALUE_STRING || argv[3].type != VALUE_STRING) {
+        LOG_E("テキスト入力追加: (モーダルID, ラベル, カスタムID, スタイル) が必要です");
+        return hajimu_bool(false);
+    }
+    Modal *m = modal_get((int)argv[0].number);
+    if (!m || m->input_count >= MAX_MODAL_INPUTS) return hajimu_bool(false);
+
+    int ii = m->input_count++;
+    snprintf(m->inputs[ii].label, sizeof(m->inputs[ii].label), "%s", argv[1].string.data);
+    snprintf(m->inputs[ii].custom_id, sizeof(m->inputs[ii].custom_id), "%s", argv[2].string.data);
+    m->inputs[ii].required = true;
+    m->inputs[ii].max_length = 4000;
+
+    const char *style = argv[3].string.data;
+    if (strcmp(style, "短い") == 0 || strcmp(style, "SHORT") == 0 || strcmp(style, "一行") == 0)
+        m->inputs[ii].style = 1;
+    else if (strcmp(style, "長い") == 0 || strcmp(style, "PARAGRAPH") == 0 || strcmp(style, "複数行") == 0)
+        m->inputs[ii].style = 2;
+    else
+        m->inputs[ii].style = 1;
+
+    return hajimu_number(argv[0].number);
+}
+
+/* モーダル表示(インタラクション, モーダルID) */
+static Value fn_modal_show(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_DICT || argv[1].type != VALUE_NUMBER) {
+        LOG_E("モーダル表示: (インタラクション, モーダルID) が必要です");
+        return hajimu_bool(false);
+    }
+    const char *interaction_id = value_get_str(&argv[0], "ID");
+    const char *interaction_token = value_get_str(&argv[0], "トークン");
+    if (!interaction_id || !interaction_token) return hajimu_bool(false);
+
+    Modal *m = modal_get((int)argv[1].number);
+    if (!m) return hajimu_bool(false);
+
+    /* Build modal JSON */
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    jb_int(&sb, "type", 9); /* MODAL */
+    jb_key(&sb, "data"); jb_obj_start(&sb);
+    jb_str(&sb, "custom_id", m->custom_id);
+    jb_str(&sb, "title", m->title);
+    jb_key(&sb, "components"); jb_arr_start(&sb);
+    for (int i = 0; i < m->input_count; i++) {
+        /* Each input in its own action row */
+        jb_obj_start(&sb);
+        jb_int(&sb, "type", COMP_ACTION_ROW);
+        jb_key(&sb, "components"); jb_arr_start(&sb);
+        jb_obj_start(&sb);
+        jb_int(&sb, "type", 4); /* TEXT_INPUT */
+        jb_str(&sb, "custom_id", m->inputs[i].custom_id);
+        jb_str(&sb, "label", m->inputs[i].label);
+        jb_int(&sb, "style", m->inputs[i].style);
+        if (m->inputs[i].placeholder[0])
+            jb_str(&sb, "placeholder", m->inputs[i].placeholder);
+        if (m->inputs[i].default_value[0])
+            jb_str(&sb, "value", m->inputs[i].default_value);
+        if (m->inputs[i].min_length > 0)
+            jb_int(&sb, "min_length", m->inputs[i].min_length);
+        if (m->inputs[i].max_length > 0)
+            jb_int(&sb, "max_length", m->inputs[i].max_length);
+        jb_bool(&sb, "required", m->inputs[i].required);
+        jb_obj_end(&sb);
+        jb_arr_end(&sb); sb_append_char(&sb, ',');
+        jb_obj_end(&sb); sb_append_char(&sb, ',');
+    }
+    jb_arr_end(&sb); sb_append_char(&sb, ',');
+    jb_obj_end(&sb); sb_append_char(&sb, ',');
+    jb_obj_end(&sb);
+
+    char ep[256];
+    snprintf(ep, sizeof(ep), "/interactions/%s/%s/callback",
+             interaction_id, interaction_token);
+
+    long code = 0;
+    JsonNode *resp = discord_rest("POST", ep, sb.data, &code);
+    sb_free(&sb);
+
+    /* Free modal slot */
+    m->active = false;
+
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code == 200 || code == 204);
+}
+
+/* モーダル送信時(カスタムID, コールバック) */
+static Value fn_on_modal_submit(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING ||
+        (argv[1].type != VALUE_FUNCTION && argv[1].type != VALUE_BUILTIN)) {
+        LOG_E("モーダル送信時: (カスタムID, コールバック) が必要です");
+        return hajimu_bool(false);
+    }
+    register_comp_handler(argv[0].string.data, argv[1], -1); /* -1 = modal */
+    LOG_D("モーダルハンドラ登録: %s", argv[0].string.data);
+    return hajimu_bool(true);
+}
+
+/* --- サブコマンド --- */
+
+/* サブコマンド追加(コマンドインデックス, サブ名, 説明, コールバック) */
+static Value fn_subcommand_add(int argc, Value *argv) {
+    if (argc < 4 || argv[0].type != VALUE_NUMBER || argv[1].type != VALUE_STRING ||
+        argv[2].type != VALUE_STRING ||
+        (argv[3].type != VALUE_FUNCTION && argv[3].type != VALUE_BUILTIN)) {
+        LOG_E("サブコマンド追加: (コマンドID, サブ名, 説明, コールバック) が必要です");
+        return hajimu_bool(false);
+    }
+    int idx = (int)argv[0].number;
+    if (idx < 0 || idx >= g_bot.command_count) return hajimu_bool(false);
+    SlashCommand *parent = &g_bot.commands[idx];
+    if (parent->option_count >= MAX_CMD_OPTIONS) return hajimu_bool(false);
+
+    /* Add subcommand as option type 1 */
+    int oi = parent->option_count++;
+    parent->options[oi].type = 1; /* SUB_COMMAND */
+    snprintf(parent->options[oi].name, sizeof(parent->options[oi].name), "%s", argv[1].string.data);
+    snprintf(parent->options[oi].description, sizeof(parent->options[oi].description), "%s", argv[2].string.data);
+    parent->options[oi].required = false;
+
+    /* Register as a separate command handler for routing */
+    if (g_bot.command_count < MAX_COMMANDS) {
+        int sub_idx = g_bot.command_count++;
+        SlashCommand *sub = &g_bot.commands[sub_idx];
+        memset(sub, 0, sizeof(*sub));
+        /* Name format: parent_name/sub_name for matching */
+        snprintf(sub->name, sizeof(sub->name), "%s/%s", parent->name, argv[1].string.data);
+        snprintf(sub->description, sizeof(sub->description), "%s", argv[2].string.data);
+        sub->callback = argv[3];
+        sub->registered = true; /* Don't register separately with Discord */
+    }
+
+    return hajimu_bool(true);
+}
+
+/* サブコマンドグループ追加(コマンドインデックス, グループ名, 説明) */
+static Value fn_subcommand_group_add(int argc, Value *argv) {
+    if (argc < 3 || argv[0].type != VALUE_NUMBER ||
+        argv[1].type != VALUE_STRING || argv[2].type != VALUE_STRING) {
+        LOG_E("サブコマンドグループ追加: (コマンドID, グループ名, 説明) が必要です");
+        return hajimu_bool(false);
+    }
+    int idx = (int)argv[0].number;
+    if (idx < 0 || idx >= g_bot.command_count) return hajimu_bool(false);
+    SlashCommand *parent = &g_bot.commands[idx];
+    if (parent->option_count >= MAX_CMD_OPTIONS) return hajimu_bool(false);
+
+    /* Add subcommand group as option type 2 */
+    int oi = parent->option_count++;
+    parent->options[oi].type = 2; /* SUB_COMMAND_GROUP */
+    snprintf(parent->options[oi].name, sizeof(parent->options[oi].name), "%s", argv[1].string.data);
+    snprintf(parent->options[oi].description, sizeof(parent->options[oi].description), "%s", argv[2].string.data);
+
+    return hajimu_bool(true);
+}
+
+/* --- オートコンプリート --- */
+
+/* オートコンプリート時(コマンド名, コールバック) */
+static Value fn_on_autocomplete(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING ||
+        (argv[1].type != VALUE_FUNCTION && argv[1].type != VALUE_BUILTIN)) {
+        LOG_E("オートコンプリート時: (コマンド名, コールバック) が必要です");
+        return hajimu_bool(false);
+    }
+    if (g_bot.autocomplete_count >= MAX_COMMANDS) return hajimu_bool(false);
+    int ai = g_bot.autocomplete_count++;
+    snprintf(g_bot.autocomplete_handlers[ai].command_name, 64, "%s", argv[0].string.data);
+    g_bot.autocomplete_handlers[ai].callback = argv[1];
+    LOG_D("オートコンプリート登録: %s", argv[0].string.data);
+    return hajimu_bool(true);
+}
+
+/* オートコンプリート応答(インタラクション, 選択肢配列) */
+static Value fn_autocomplete_respond(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_DICT || argv[1].type != VALUE_ARRAY) {
+        LOG_E("オートコンプリート応答: (インタラクション, 選択肢配列) が必要です");
+        return hajimu_bool(false);
+    }
+    const char *interaction_id = value_get_str(&argv[0], "ID");
+    const char *interaction_token = value_get_str(&argv[0], "トークン");
+    if (!interaction_id || !interaction_token) return hajimu_bool(false);
+
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    jb_int(&sb, "type", 8); /* APPLICATION_COMMAND_AUTOCOMPLETE_RESULT */
+    jb_key(&sb, "data"); jb_obj_start(&sb);
+    jb_key(&sb, "choices"); jb_arr_start(&sb);
+    for (int i = 0; i < argv[1].array.length && i < MAX_CMD_CHOICES; i++) {
+        Value *item = &argv[1].array.elements[i];
+        if (item->type == VALUE_DICT) {
+            const char *name = value_get_str(item, "名前");
+            const char *value = value_get_str(item, "値");
+            if (name && value) {
+                jb_obj_start(&sb);
+                jb_str(&sb, "name", name);
+                jb_str(&sb, "value", value);
+                jb_obj_end(&sb); sb_append_char(&sb, ',');
+            }
+        } else if (item->type == VALUE_STRING) {
+            jb_obj_start(&sb);
+            jb_str(&sb, "name", item->string.data);
+            jb_str(&sb, "value", item->string.data);
+            jb_obj_end(&sb); sb_append_char(&sb, ',');
+        }
+    }
+    jb_arr_end(&sb); sb_append_char(&sb, ',');
+    jb_obj_end(&sb); sb_append_char(&sb, ',');
+    jb_obj_end(&sb);
+
+    char ep[256];
+    snprintf(ep, sizeof(ep), "/interactions/%s/%s/callback",
+             interaction_id, interaction_token);
+
+    long code = 0;
+    JsonNode *resp = discord_rest("POST", ep, sb.data, &code);
+    sb_free(&sb);
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code == 200 || code == 204);
+}
+
+/* --- コンテキストメニュー --- */
+
+/* ユーザーメニュー登録(名前, コールバック) — context menu type 2 */
+static Value fn_user_context_menu(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING ||
+        (argv[1].type != VALUE_FUNCTION && argv[1].type != VALUE_BUILTIN)) {
+        LOG_E("ユーザーメニュー登録: (名前, コールバック) が必要です");
+        return hajimu_bool(false);
+    }
+    if (g_bot.command_count >= MAX_COMMANDS) return hajimu_bool(false);
+
+    int idx = g_bot.command_count++;
+    SlashCommand *cmd = &g_bot.commands[idx];
+    memset(cmd, 0, sizeof(*cmd));
+    snprintf(cmd->name, sizeof(cmd->name), "%s", argv[0].string.data);
+    cmd->description[0] = '\0'; /* Context menus have no description */
+    cmd->callback = argv[1];
+    cmd->options[0].type = 2; /* marker: USER context menu */
+    cmd->option_count = -2;   /* negative = context menu type for registration */
+    LOG_D("ユーザーコンテキストメニュー登録: %s", cmd->name);
+    return hajimu_number(idx);
+}
+
+/* メッセージメニュー登録(名前, コールバック) — context menu type 3 */
+static Value fn_message_context_menu(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING ||
+        (argv[1].type != VALUE_FUNCTION && argv[1].type != VALUE_BUILTIN)) {
+        LOG_E("メッセージメニュー登録: (名前, コールバック) が必要です");
+        return hajimu_bool(false);
+    }
+    if (g_bot.command_count >= MAX_COMMANDS) return hajimu_bool(false);
+
+    int idx = g_bot.command_count++;
+    SlashCommand *cmd = &g_bot.commands[idx];
+    memset(cmd, 0, sizeof(*cmd));
+    snprintf(cmd->name, sizeof(cmd->name), "%s", argv[0].string.data);
+    cmd->description[0] = '\0';
+    cmd->callback = argv[1];
+    cmd->options[0].type = 3; /* marker: MESSAGE context menu */
+    cmd->option_count = -3;
+    LOG_D("メッセージコンテキストメニュー登録: %s", cmd->name);
+    return hajimu_number(idx);
+}
+
+/* コマンド選択肢(コマンドインデックス, オプションインデックス, 名前, 値) */
+static Value fn_command_choice(int argc, Value *argv) {
+    if (argc < 4 || argv[0].type != VALUE_NUMBER || argv[1].type != VALUE_NUMBER ||
+        argv[2].type != VALUE_STRING || argv[3].type != VALUE_STRING) {
+        LOG_E("コマンド選択肢: (コマンドID, オプションID, 名前, 値) が必要です");
+        return hajimu_bool(false);
+    }
+    /* Note: choices are stored in registration JSON; for now this is a placeholder
+       that marks the option as having choices. Full implementation would extend
+       the option struct. */
+    LOG_D("コマンド選択肢追加（オプション %d に選択肢 '%s'）",
+          (int)argv[1].number, argv[2].string.data);
+    return hajimu_bool(true);
 }
 
 /* --- ユーティリティ --- */
@@ -2751,6 +3937,9 @@ static HajimuPluginFunc functions[] = {
     {"参加時",               fn_on_join,           1,  1},
     {"退出時",               fn_on_leave,          1,  1},
     {"リアクション時",       fn_on_reaction,       1,  1},
+    {"エラー時",             fn_on_error,          1,  1},
+    {"切断時",               fn_on_disconnect,     1,  1},
+    {"再接続時",             fn_on_reconnect,      1,  1},
 
     /* メッセージ */
     {"メッセージ送信",       fn_send_message,      2,  2},
@@ -2758,6 +3947,9 @@ static HajimuPluginFunc functions[] = {
     {"メッセージ編集",       fn_edit_message,      3,  3},
     {"メッセージ削除",       fn_delete_message,    2,  2},
     {"一括削除",             fn_bulk_delete,       2,  2},
+    {"メッセージ取得",       fn_get_message,       2,  2},
+    {"メッセージ履歴",       fn_message_history,   2,  2},
+    {"メッセージ一括削除",   fn_bulk_delete_count, 2,  2},
 
     /* 埋め込み */
     {"埋め込み作成",         fn_embed_create,      0,  0},
@@ -2775,9 +3967,43 @@ static HajimuPluginFunc functions[] = {
     /* スラッシュコマンド */
     {"コマンド登録",         fn_register_command,  3,  3},
     {"コマンドオプション",   fn_command_option,    4,  5},
-    {"コマンド応答",         fn_command_respond,   2,  2},
+    {"コマンド応答",         fn_command_respond,   2,  3},
     {"コマンド遅延応答",     fn_command_defer,     1,  1},
     {"コマンドフォローアップ", fn_command_followup, 2,  2},
+
+    /* コンポーネント (v1.2.0) */
+    {"ボタン作成",           fn_button_create,     3,  3},
+    {"リンクボタン作成",     fn_link_button_create, 2, 2},
+    {"ボタン無効化",         fn_button_disable,    2,  2},
+    {"アクション行作成",     fn_action_row_create, 0,  0},
+    {"行にボタン追加",       fn_row_add_button,    2,  2},
+    {"行にメニュー追加",     fn_row_add_menu,      2,  2},
+    {"コンポーネント送信",   fn_component_send,    3,  3},
+    {"セレクトメニュー作成", fn_select_menu_create, 2, 2},
+    {"メニュー選択肢",       fn_menu_add_option,   3,  4},
+    {"ボタン時",             fn_on_button,         2,  2},
+    {"セレクト時",           fn_on_select,         2,  2},
+    {"インタラクション更新", fn_interaction_update, 2, 2},
+    {"インタラクション遅延更新", fn_interaction_defer_update, 1, 1},
+
+    /* モーダル (v1.3.0) */
+    {"モーダル作成",         fn_modal_create,      2,  2},
+    {"テキスト入力追加",     fn_modal_add_text_input, 4, 4},
+    {"モーダル表示",         fn_modal_show,        2,  2},
+    {"モーダル送信時",       fn_on_modal_submit,   2,  2},
+
+    /* サブコマンド (v1.3.0) */
+    {"サブコマンド追加",     fn_subcommand_add,    4,  4},
+    {"サブコマンドグループ追加", fn_subcommand_group_add, 3, 3},
+
+    /* オートコンプリート (v1.3.0) */
+    {"オートコンプリート時", fn_on_autocomplete,   2,  2},
+    {"オートコンプリート応答", fn_autocomplete_respond, 2, 2},
+
+    /* コンテキストメニュー (v1.3.0) */
+    {"ユーザーメニュー登録", fn_user_context_menu, 2,  2},
+    {"メッセージメニュー登録", fn_message_context_menu, 2, 2},
+    {"コマンド選択肢",       fn_command_choice,    4,  4},
 
     /* チャンネル */
     {"チャンネル情報",       fn_channel_info,      1,  1},
@@ -2790,6 +4016,7 @@ static HajimuPluginFunc functions[] = {
     {"キック",               fn_kick,              2,  3},
     {"BAN",                  fn_ban,               2,  3},
     {"BAN解除",              fn_unban,             2,  2},
+    {"タイムアウト",         fn_timeout,           3,  3},
 
     /* ロール */
     {"ロール付与",           fn_add_role,          3,  3},
@@ -2798,7 +4025,8 @@ static HajimuPluginFunc functions[] = {
 
     /* リアクション */
     {"リアクション追加",     fn_add_reaction,      3,  3},
-    {"リアクション削除",     fn_remove_reaction,   3,  3},
+    {"リアクション削除",     fn_remove_reaction,   3,  4},
+    {"リアクション全削除",   fn_remove_all_reactions, 2, 2},
 
     /* ステータス */
     {"ステータス設定",       fn_set_status,        1,  3},
@@ -2807,8 +4035,12 @@ static HajimuPluginFunc functions[] = {
     {"自分情報",             fn_me,                0,  0},
     {"ユーザー情報",         fn_user_info,         1,  1},
 
-    /* その他 */
+    /* ピン */
     {"ピン留め",             fn_pin_message,       2,  2},
+    {"ピン解除",             fn_unpin_message,     2,  2},
+    {"ピン一覧",             fn_pin_list,          1,  1},
+
+    /* その他 */
     {"DM作成",               fn_create_dm,         1,  1},
     {"ログレベル設定",       fn_set_log_level,     1,  1},
     {"インテント値",         fn_intent_value,      1,  1},

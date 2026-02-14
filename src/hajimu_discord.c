@@ -20,6 +20,7 @@
  * v1.7.1 — 2026-02-14  セキュリティ修正・バグ修正
  * v2.0.0 — 2026-02-14  ボイスチャンネル対応 (Opus/Sodium)
  * v2.1.0 — 2026-02-14  ステージチャンネル・スタンプ・サーバー編集・Markdownユーティリティ
+ * v2.2.0 — 2026-02-14  Components V2・テンプレート・オンボーディング・サウンドボード・OAuth2・シャーディング
  */
 
 #define _GNU_SOURCE
@@ -61,7 +62,7 @@
  * ========================================================================= */
 
 #define PLUGIN_NAME    "hajimu_discord"
-#define PLUGIN_VERSION "2.1.0"
+#define PLUGIN_VERSION "2.2.0"
 
 /* Discord API */
 #define DISCORD_API_BASE    "https://discord.com/api/v10"
@@ -473,6 +474,11 @@ typedef struct {
     /* Voice connections (v2.0.0) */
     VoiceConn voice_conns[MAX_VOICE_CONNS];
     int voice_conn_count;
+
+    /* Sharding (v2.2.0) */
+    int shard_id;
+    int shard_count;
+    bool sharding_enabled;
 } BotState;
 
 static BotState g_bot = {0};
@@ -1734,6 +1740,11 @@ static void gw_send_identify(void) {
     jb_str(&sb, "browser", "hajimu_discord");
     jb_str(&sb, "device", "hajimu_discord");
     jb_obj_end(&sb); sb_append_char(&sb, ',');
+    /* Sharding (v2.2.0) */
+    if (g_bot.sharding_enabled) {
+        jb_key(&sb, "shard");
+        sb_appendf(&sb, "[%d,%d],", g_bot.shard_id, g_bot.shard_count);
+    }
     jb_obj_end(&sb); sb_append_char(&sb, ',');
     jb_obj_end(&sb);
     gw_send_json(sb.data);
@@ -6980,6 +6991,847 @@ static Value fn_md_list(int argc, Value *argv) {
 }
 
 /* =========================================================================
+ * v2.2.0: Components V2・テンプレート・オンボーディング・サウンドボード・
+ *         ロール接続・エンタイトルメント・OAuth2・シャーディング
+ * ========================================================================= */
+
+/* ===========================================
+ * Components V2  (flags: 1<<15 = 32768)
+ * =========================================== */
+
+/* テキスト表示(ID, テキスト) — type:10 TextDisplay */
+static Value fn_comp_text_display(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_NUMBER || argv[1].type != VALUE_STRING)
+        return hajimu_string("");
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    jb_int(&sb, "type", 10);
+    jb_int(&sb, "id", (int64_t)argv[0].number);
+    jb_str(&sb, "content", argv[1].string.data);
+    jb_obj_end(&sb);
+    Value r = hajimu_string(sb.data);
+    sb_free(&sb);
+    return r;
+}
+
+/* セパレーター(ID[, 余白, 区切り線]) — type:14 Separator */
+static Value fn_comp_separator(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_NUMBER) return hajimu_string("");
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    jb_int(&sb, "type", 14);
+    jb_int(&sb, "id", (int64_t)argv[0].number);
+    if (argc >= 2 && argv[1].type == VALUE_BOOL)
+        jb_bool(&sb, "spacing", argv[1].boolean);
+    if (argc >= 3 && argv[2].type == VALUE_BOOL)
+        jb_bool(&sb, "divider", argv[2].boolean);
+    jb_obj_end(&sb);
+    Value r = hajimu_string(sb.data);
+    sb_free(&sb);
+    return r;
+}
+
+/* メディアギャラリー(ID, アイテム配列) — type:12 MediaGallery */
+static Value fn_comp_media_gallery(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_NUMBER || argv[1].type != VALUE_ARRAY)
+        return hajimu_string("");
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    jb_int(&sb, "type", 12);
+    jb_int(&sb, "id", (int64_t)argv[0].number);
+    jb_key(&sb, "items"); jb_arr_start(&sb);
+    for (int i = 0; i < argv[1].array.length; i++) {
+        if (argv[1].array.elements[i].type == VALUE_STRING) {
+            sb_append(&sb, argv[1].array.elements[i].string.data);
+            sb_append_char(&sb, ',');
+        }
+    }
+    jb_arr_end(&sb); sb_append_char(&sb, ',');
+    jb_obj_end(&sb);
+    Value r = hajimu_string(sb.data);
+    sb_free(&sb);
+    return r;
+}
+
+/* メディアアイテム(URL[, 説明]) — MediaGalleryItem JSON snippet */
+static Value fn_comp_media_item(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_string("");
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    jb_key(&sb, "media"); jb_obj_start(&sb);
+    jb_str(&sb, "url", argv[0].string.data);
+    jb_obj_end(&sb); sb_append_char(&sb, ',');
+    if (argc >= 2 && argv[1].type == VALUE_STRING)
+        jb_str(&sb, "description", argv[1].string.data);
+    jb_obj_end(&sb);
+    Value r = hajimu_string(sb.data);
+    sb_free(&sb);
+    return r;
+}
+
+/* サムネイル(ID, URL[, 説明]) — type:11 Thumbnail */
+static Value fn_comp_thumbnail(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_NUMBER || argv[1].type != VALUE_STRING)
+        return hajimu_string("");
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    jb_int(&sb, "type", 11);
+    jb_int(&sb, "id", (int64_t)argv[0].number);
+    jb_key(&sb, "media"); jb_obj_start(&sb);
+    jb_str(&sb, "url", argv[1].string.data);
+    jb_obj_end(&sb); sb_append_char(&sb, ',');
+    if (argc >= 3 && argv[2].type == VALUE_STRING)
+        jb_str(&sb, "description", argv[2].string.data);
+    jb_obj_end(&sb);
+    Value r = hajimu_string(sb.data);
+    sb_free(&sb);
+    return r;
+}
+
+/* セクション(ID, コンポーネント配列[, サムネイル]) — type:9 Section */
+static Value fn_comp_section(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_NUMBER || argv[1].type != VALUE_ARRAY)
+        return hajimu_string("");
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    jb_int(&sb, "type", 9);
+    jb_int(&sb, "id", (int64_t)argv[0].number);
+    jb_key(&sb, "components"); jb_arr_start(&sb);
+    for (int i = 0; i < argv[1].array.length; i++) {
+        if (argv[1].array.elements[i].type == VALUE_STRING) {
+            sb_append(&sb, argv[1].array.elements[i].string.data);
+            sb_append_char(&sb, ',');
+        }
+    }
+    jb_arr_end(&sb); sb_append_char(&sb, ',');
+    if (argc >= 3 && argv[2].type == VALUE_STRING) {
+        jb_key(&sb, "accessory");
+        sb_append(&sb, argv[2].string.data);
+        sb_append_char(&sb, ',');
+    }
+    jb_obj_end(&sb);
+    Value r = hajimu_string(sb.data);
+    sb_free(&sb);
+    return r;
+}
+
+/* コンテナ(ID, コンポーネント配列[, 色, スポイラー]) — type:17 Container */
+static Value fn_comp_container(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_NUMBER || argv[1].type != VALUE_ARRAY)
+        return hajimu_string("");
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    jb_int(&sb, "type", 17);
+    jb_int(&sb, "id", (int64_t)argv[0].number);
+    jb_key(&sb, "components"); jb_arr_start(&sb);
+    for (int i = 0; i < argv[1].array.length; i++) {
+        if (argv[1].array.elements[i].type == VALUE_STRING) {
+            sb_append(&sb, argv[1].array.elements[i].string.data);
+            sb_append_char(&sb, ',');
+        }
+    }
+    jb_arr_end(&sb); sb_append_char(&sb, ',');
+    if (argc >= 3 && argv[2].type == VALUE_NUMBER)
+        jb_int(&sb, "accent_color", (int64_t)argv[2].number);
+    if (argc >= 4 && argv[3].type == VALUE_BOOL)
+        jb_bool(&sb, "spoiler", argv[3].boolean);
+    jb_obj_end(&sb);
+    Value r = hajimu_string(sb.data);
+    sb_free(&sb);
+    return r;
+}
+
+/* ファイル表示(ID, URL) — type:13 File */
+static Value fn_comp_file(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_NUMBER || argv[1].type != VALUE_STRING)
+        return hajimu_string("");
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    jb_int(&sb, "type", 13);
+    jb_int(&sb, "id", (int64_t)argv[0].number);
+    jb_key(&sb, "file"); jb_obj_start(&sb);
+    jb_str(&sb, "url", argv[1].string.data);
+    jb_obj_end(&sb); sb_append_char(&sb, ',');
+    jb_obj_end(&sb);
+    Value r = hajimu_string(sb.data);
+    sb_free(&sb);
+    return r;
+}
+
+/* V2メッセージ送信(チャンネルID, コンポーネント配列) — Send with IS_COMPONENTS_V2 flag */
+static Value fn_send_components_v2(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_ARRAY) {
+        LOG_E("V2メッセージ送信: チャンネルID, コンポーネント配列が必要です");
+        return hajimu_null();
+    }
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    jb_int(&sb, "flags", 32768); /* IS_COMPONENTS_V2 = 1<<15 */
+    jb_key(&sb, "components"); jb_arr_start(&sb);
+    for (int i = 0; i < argv[1].array.length; i++) {
+        if (argv[1].array.elements[i].type == VALUE_STRING) {
+            sb_append(&sb, argv[1].array.elements[i].string.data);
+            sb_append_char(&sb, ',');
+        }
+    }
+    jb_arr_end(&sb); sb_append_char(&sb, ',');
+    jb_obj_end(&sb);
+
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/channels/%s/messages", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("POST", ep, sb.data, &code);
+    sb_free(&sb);
+    Value result = hajimu_null();
+    if (resp && (code == 200 || code == 201)) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* ===========================================
+ * サーバーテンプレート
+ * =========================================== */
+
+/* テンプレート一覧(サーバーID) — Get Guild Templates */
+static Value fn_template_list(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_array();
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/guilds/%s/templates", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", ep, NULL, &code);
+    Value result = hajimu_array();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* テンプレート取得(テンプレートコード) — Get Guild Template */
+static Value fn_template_get(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_null();
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/guilds/templates/%s", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", ep, NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* テンプレート作成(サーバーID, 名前[, 説明]) — Create Guild Template */
+static Value fn_template_create(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING) {
+        LOG_E("テンプレート作成: サーバーID, 名前が必要です");
+        return hajimu_null();
+    }
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    jb_str(&sb, "name", argv[1].string.data);
+    if (argc >= 3 && argv[2].type == VALUE_STRING)
+        jb_str(&sb, "description", argv[2].string.data);
+    jb_obj_end(&sb);
+
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/guilds/%s/templates", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("POST", ep, sb.data, &code);
+    sb_free(&sb);
+    Value result = hajimu_null();
+    if (resp && (code == 200 || code == 201)) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* テンプレート同期(サーバーID, テンプレートコード) — Sync Guild Template */
+static Value fn_template_sync(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING)
+        return hajimu_bool(false);
+    char ep[160];
+    snprintf(ep, sizeof(ep), "/guilds/%s/templates/%s",
+             argv[0].string.data, argv[1].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("PUT", ep, NULL, &code);
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code == 200);
+}
+
+/* テンプレート編集(サーバーID, テンプレートコード, 設定) — Modify Guild Template */
+static Value fn_template_edit(int argc, Value *argv) {
+    if (argc < 3 || argv[0].type != VALUE_STRING ||
+        argv[1].type != VALUE_STRING || argv[2].type != VALUE_STRING)
+        return hajimu_null();
+    char ep[160];
+    snprintf(ep, sizeof(ep), "/guilds/%s/templates/%s",
+             argv[0].string.data, argv[1].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("PATCH", ep, argv[2].string.data, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* テンプレート削除(サーバーID, テンプレートコード) — Delete Guild Template */
+static Value fn_template_delete(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING)
+        return hajimu_bool(false);
+    char ep[160];
+    snprintf(ep, sizeof(ep), "/guilds/%s/templates/%s",
+             argv[0].string.data, argv[1].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("DELETE", ep, NULL, &code);
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code == 204);
+}
+
+/* テンプレートからサーバー作成(テンプレートコード, サーバー名) — Create Guild from Template */
+static Value fn_template_use(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING) {
+        LOG_E("テンプレートからサーバー作成: テンプレートコード, サーバー名が必要です");
+        return hajimu_null();
+    }
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    jb_str(&sb, "name", argv[1].string.data);
+    jb_obj_end(&sb);
+
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/guilds/templates/%s", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("POST", ep, sb.data, &code);
+    sb_free(&sb);
+    Value result = hajimu_null();
+    if (resp && (code == 200 || code == 201)) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* ===========================================
+ * オンボーディング設定
+ * =========================================== */
+
+/* オンボーディング取得(サーバーID) — Get Guild Onboarding */
+static Value fn_onboarding_get(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_null();
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/guilds/%s/onboarding", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", ep, NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* オンボーディング設定(サーバーID, 設定) — Modify Guild Onboarding */
+static Value fn_onboarding_edit(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING) {
+        LOG_E("オンボーディング設定: サーバーID, 設定(JSON)が必要です");
+        return hajimu_null();
+    }
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/guilds/%s/onboarding", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("PUT", ep, argv[1].string.data, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* ===========================================
+ * サウンドボード
+ * =========================================== */
+
+/* サウンドボード一覧(サーバーID) — List Guild Soundboard Sounds */
+static Value fn_soundboard_list(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_array();
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/guilds/%s/soundboard-sounds", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", ep, NULL, &code);
+    Value result = hajimu_array();
+    if (resp && code == 200) {
+        JsonNode *items = json_get(resp, "items");
+        result = json_to_value(items ? items : resp);
+    }
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* サウンドボード取得(サーバーID, サウンドID) — Get Guild Soundboard Sound */
+static Value fn_soundboard_get(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING)
+        return hajimu_null();
+    char ep[160];
+    snprintf(ep, sizeof(ep), "/guilds/%s/soundboard-sounds/%s",
+             argv[0].string.data, argv[1].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", ep, NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* サウンドボード作成(サーバーID, 名前, サウンドデータ[, 音量, 絵文字ID]) */
+static Value fn_soundboard_create(int argc, Value *argv) {
+    if (argc < 3 || argv[0].type != VALUE_STRING ||
+        argv[1].type != VALUE_STRING || argv[2].type != VALUE_STRING) {
+        LOG_E("サウンドボード作成: サーバーID, 名前, base64データが必要です");
+        return hajimu_null();
+    }
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    jb_str(&sb, "name", argv[1].string.data);
+    jb_str(&sb, "sound", argv[2].string.data); /* base64 encoded */
+    if (argc >= 4 && argv[3].type == VALUE_NUMBER)
+        jb_num(&sb, "volume", argv[3].number);
+    if (argc >= 5 && argv[4].type == VALUE_STRING)
+        jb_str(&sb, "emoji_id", argv[4].string.data);
+    jb_obj_end(&sb);
+
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/guilds/%s/soundboard-sounds", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("POST", ep, sb.data, &code);
+    sb_free(&sb);
+    Value result = hajimu_null();
+    if (resp && (code == 200 || code == 201)) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* サウンドボード編集(サーバーID, サウンドID, 設定) */
+static Value fn_soundboard_edit(int argc, Value *argv) {
+    if (argc < 3 || argv[0].type != VALUE_STRING ||
+        argv[1].type != VALUE_STRING || argv[2].type != VALUE_STRING)
+        return hajimu_null();
+    char ep[160];
+    snprintf(ep, sizeof(ep), "/guilds/%s/soundboard-sounds/%s",
+             argv[0].string.data, argv[1].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("PATCH", ep, argv[2].string.data, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* サウンドボード削除(サーバーID, サウンドID) */
+static Value fn_soundboard_delete(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING)
+        return hajimu_bool(false);
+    char ep[160];
+    snprintf(ep, sizeof(ep), "/guilds/%s/soundboard-sounds/%s",
+             argv[0].string.data, argv[1].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("DELETE", ep, NULL, &code);
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code == 204);
+}
+
+/* サウンドボード再生(チャンネルID, サウンドID[, ソースサーバーID]) — Send Soundboard Sound */
+static Value fn_soundboard_play(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING)
+        return hajimu_bool(false);
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    jb_str(&sb, "sound_id", argv[1].string.data);
+    if (argc >= 3 && argv[2].type == VALUE_STRING)
+        jb_str(&sb, "source_guild_id", argv[2].string.data);
+    jb_obj_end(&sb);
+
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/channels/%s/send-soundboard-sound",
+             argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("POST", ep, sb.data, &code);
+    sb_free(&sb);
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code == 200 || code == 204);
+}
+
+/* デフォルトサウンドボード一覧() — List Default Soundboard Sounds */
+static Value fn_soundboard_defaults(int argc, Value *argv) {
+    (void)argc; (void)argv;
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", "/soundboard-default-sounds", NULL, &code);
+    Value result = hajimu_array();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* ===========================================
+ * ロール接続メタデータ (Linked Roles)
+ * =========================================== */
+
+/* ロール接続メタデータ取得(アプリケーションID) */
+static Value fn_role_connection_meta_get(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_array();
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/applications/%s/role-connections/metadata",
+             argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", ep, NULL, &code);
+    Value result = hajimu_array();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* ロール接続メタデータ設定(アプリケーションID, メタデータ配列JSON) */
+static Value fn_role_connection_meta_set(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING) {
+        LOG_E("ロール接続メタデータ設定: アプリケーションID, JSON配列が必要です");
+        return hajimu_null();
+    }
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/applications/%s/role-connections/metadata",
+             argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("PUT", ep, argv[1].string.data, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* ユーザーロール接続取得(アプリケーションID) — Get User Role Connection */
+static Value fn_user_role_connection_get(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_null();
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/users/@me/applications/%s/role-connection",
+             argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", ep, NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* ユーザーロール接続更新(アプリケーションID, 設定) — Update User Role Connection */
+static Value fn_user_role_connection_set(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING)
+        return hajimu_null();
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/users/@me/applications/%s/role-connection",
+             argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("PUT", ep, argv[1].string.data, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* ===========================================
+ * エンタイトルメント / SKU
+ * =========================================== */
+
+/* SKU一覧(アプリケーションID) — List SKUs */
+static Value fn_sku_list(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_array();
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/applications/%s/skus", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", ep, NULL, &code);
+    Value result = hajimu_array();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* エンタイトルメント一覧(アプリケーションID) — List Entitlements */
+static Value fn_entitlement_list(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_array();
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/applications/%s/entitlements", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", ep, NULL, &code);
+    Value result = hajimu_array();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* エンタイトルメント消費(アプリケーションID, エンタイトルメントID) — Consume */
+static Value fn_entitlement_consume(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING)
+        return hajimu_bool(false);
+    char ep[160];
+    snprintf(ep, sizeof(ep), "/applications/%s/entitlements/%s/consume",
+             argv[0].string.data, argv[1].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("POST", ep, NULL, &code);
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code == 204);
+}
+
+/* テストエンタイトルメント作成(アプリケーションID, SKU_ID, OwnerID, OwnerType) */
+static Value fn_entitlement_test_create(int argc, Value *argv) {
+    if (argc < 4 || argv[0].type != VALUE_STRING ||
+        argv[1].type != VALUE_STRING || argv[2].type != VALUE_STRING ||
+        argv[3].type != VALUE_NUMBER) {
+        LOG_E("テストエンタイトルメント作成: アプリID, SKU_ID, OwnerID, OwnerType(1=guild,2=user)が必要です");
+        return hajimu_null();
+    }
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    jb_str(&sb, "sku_id", argv[1].string.data);
+    jb_str(&sb, "owner_id", argv[2].string.data);
+    jb_int(&sb, "owner_type", (int64_t)argv[3].number);
+    jb_obj_end(&sb);
+
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/applications/%s/entitlements", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("POST", ep, sb.data, &code);
+    sb_free(&sb);
+    Value result = hajimu_null();
+    if (resp && (code == 200 || code == 201)) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* テストエンタイトルメント削除(アプリケーションID, エンタイトルメントID) */
+static Value fn_entitlement_test_delete(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING)
+        return hajimu_bool(false);
+    char ep[160];
+    snprintf(ep, sizeof(ep), "/applications/%s/entitlements/%s",
+             argv[0].string.data, argv[1].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("DELETE", ep, NULL, &code);
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code == 204);
+}
+
+/* ===========================================
+ * OAuth2
+ * =========================================== */
+
+/* OAuth2トークン交換(クライアントID, クライアントシークレット, コード, リダイレクトURI) */
+static Value fn_oauth2_token_exchange(int argc, Value *argv) {
+    if (argc < 4 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING ||
+        argv[2].type != VALUE_STRING || argv[3].type != VALUE_STRING) {
+        LOG_E("OAuth2トークン交換: クライアントID, シークレット, コード, リダイレクトURIが必要です");
+        return hajimu_null();
+    }
+    /* OAuth2 token exchange uses application/x-www-form-urlencoded */
+    CURL *curl = curl_easy_init();
+    if (!curl) return hajimu_null();
+
+    char post_data[2048];
+    char *encoded_uri = curl_easy_escape(curl, argv[3].string.data, 0);
+    snprintf(post_data, sizeof(post_data),
+             "grant_type=authorization_code&code=%s&redirect_uri=%s",
+             argv[2].string.data, encoded_uri ? encoded_uri : argv[3].string.data);
+    if (encoded_uri) curl_free(encoded_uri);
+
+    char url[] = "https://discord.com/api/v10/oauth2/token";
+    CurlBuf resp_buf = {(char *)calloc(1, 4096), 0};
+
+    struct curl_slist *hdrs = NULL;
+    hdrs = curl_slist_append(hdrs, "Content-Type: application/x-www-form-urlencoded");
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+    curl_easy_setopt(curl, CURLOPT_USERNAME, argv[0].string.data);
+    curl_easy_setopt(curl, CURLOPT_PASSWORD, argv[1].string.data);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp_buf);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+
+    CURLcode res = curl_easy_perform(curl);
+    long code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(curl);
+
+    Value result = hajimu_null();
+    if (res == CURLE_OK && resp_buf.data && resp_buf.len > 0) {
+        JsonNode *json = json_parse(resp_buf.data);
+        if (json && code == 200) result = json_to_value(json);
+        if (json) { json_free(json); free(json); }
+    }
+    free(resp_buf.data);
+    return result;
+}
+
+/* OAuth2トークンリフレッシュ(クライアントID, シークレット, リフレッシュトークン) */
+static Value fn_oauth2_token_refresh(int argc, Value *argv) {
+    if (argc < 3 || argv[0].type != VALUE_STRING ||
+        argv[1].type != VALUE_STRING || argv[2].type != VALUE_STRING) {
+        LOG_E("OAuth2トークンリフレッシュ: クライアントID, シークレット, リフレッシュトークンが必要です");
+        return hajimu_null();
+    }
+    CURL *curl = curl_easy_init();
+    if (!curl) return hajimu_null();
+
+    char post_data[1024];
+    snprintf(post_data, sizeof(post_data),
+             "grant_type=refresh_token&refresh_token=%s", argv[2].string.data);
+
+    char url[] = "https://discord.com/api/v10/oauth2/token";
+    CurlBuf resp_buf = {(char *)calloc(1, 4096), 0};
+
+    struct curl_slist *hdrs = NULL;
+    hdrs = curl_slist_append(hdrs, "Content-Type: application/x-www-form-urlencoded");
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+    curl_easy_setopt(curl, CURLOPT_USERNAME, argv[0].string.data);
+    curl_easy_setopt(curl, CURLOPT_PASSWORD, argv[1].string.data);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp_buf);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+
+    CURLcode res = curl_easy_perform(curl);
+    long code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(curl);
+
+    Value result = hajimu_null();
+    if (res == CURLE_OK && resp_buf.data) {
+        JsonNode *json = json_parse(resp_buf.data);
+        if (json && code == 200) result = json_to_value(json);
+        if (json) { json_free(json); free(json); }
+    }
+    free(resp_buf.data);
+    return result;
+}
+
+/* OAuth2トークン無効化(クライアントID, シークレット, トークン) */
+static Value fn_oauth2_token_revoke(int argc, Value *argv) {
+    if (argc < 3 || argv[0].type != VALUE_STRING ||
+        argv[1].type != VALUE_STRING || argv[2].type != VALUE_STRING)
+        return hajimu_bool(false);
+    CURL *curl = curl_easy_init();
+    if (!curl) return hajimu_bool(false);
+
+    char post_data[1024];
+    snprintf(post_data, sizeof(post_data), "token=%s", argv[2].string.data);
+
+    char url[] = "https://discord.com/api/v10/oauth2/token/revoke";
+    CurlBuf resp_buf = {(char *)calloc(1, 1024), 0};
+
+    struct curl_slist *hdrs = NULL;
+    hdrs = curl_slist_append(hdrs, "Content-Type: application/x-www-form-urlencoded");
+
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+    curl_easy_setopt(curl, CURLOPT_USERNAME, argv[0].string.data);
+    curl_easy_setopt(curl, CURLOPT_PASSWORD, argv[1].string.data);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp_buf);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+
+    CURLcode res = curl_easy_perform(curl);
+    long code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(curl);
+    free(resp_buf.data);
+    return hajimu_bool(res == CURLE_OK && code == 200);
+}
+
+/* OAuth2自分情報() — GET /oauth2/@me */
+static Value fn_oauth2_me(int argc, Value *argv) {
+    (void)argc; (void)argv;
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", "/oauth2/@me", NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* OAuth2認可URL生成(クライアントID, リダイレクトURI, スコープ配列) */
+static Value fn_oauth2_auth_url(int argc, Value *argv) {
+    if (argc < 3 || argv[0].type != VALUE_STRING ||
+        argv[1].type != VALUE_STRING || argv[2].type != VALUE_ARRAY) {
+        LOG_E("OAuth2認可URL生成: クライアントID, リダイレクトURI, スコープ配列が必要です");
+        return hajimu_string("");
+    }
+    StrBuf sb; sb_init(&sb);
+    sb_append(&sb, "https://discord.com/oauth2/authorize?client_id=");
+    sb_append(&sb, argv[0].string.data);
+    sb_append(&sb, "&redirect_uri=");
+
+    CURL *curl = curl_easy_init();
+    if (curl) {
+        char *encoded = curl_easy_escape(curl, argv[1].string.data, 0);
+        if (encoded) { sb_append(&sb, encoded); curl_free(encoded); }
+        else sb_append(&sb, argv[1].string.data);
+        curl_easy_cleanup(curl);
+    }
+
+    sb_append(&sb, "&response_type=code&scope=");
+    for (int i = 0; i < argv[2].array.length; i++) {
+        if (argv[2].array.elements[i].type == VALUE_STRING) {
+            if (i > 0) sb_append(&sb, "%20");
+            sb_append(&sb, argv[2].array.elements[i].string.data);
+        }
+    }
+    Value r = hajimu_string(sb.data);
+    sb_free(&sb);
+    return r;
+}
+
+/* ===========================================
+ * シャーディング
+ * =========================================== */
+
+/* シャード設定(シャードID, シャード数) — Configure sharding for IDENTIFY */
+static Value fn_shard_set(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_NUMBER || argv[1].type != VALUE_NUMBER) {
+        LOG_E("シャード設定: シャードID(数値), シャード数(数値)が必要です");
+        return hajimu_bool(false);
+    }
+    g_bot.shard_id = (int)argv[0].number;
+    g_bot.shard_count = (int)argv[1].number;
+    g_bot.sharding_enabled = true;
+    LOG_I("シャード設定: shard_id=%d, shard_count=%d",
+          g_bot.shard_id, g_bot.shard_count);
+    return hajimu_bool(true);
+}
+
+/* シャード情報() — Get Gateway Bot (recommended shards) */
+static Value fn_shard_info(int argc, Value *argv) {
+    (void)argc; (void)argv;
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", "/gateway/bot", NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* シャードID計算(サーバーID, シャード数) — (guild_id >> 22) % num_shards */
+static Value fn_shard_id_for(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_NUMBER)
+        return hajimu_number(0);
+    uint64_t guild_id = (uint64_t)strtoull(argv[0].string.data, NULL, 10);
+    int num_shards = (int)argv[1].number;
+    if (num_shards <= 0) num_shards = 1;
+    int shard = (int)((guild_id >> 22) % (uint64_t)num_shards);
+    return hajimu_number(shard);
+}
+
+/* =========================================================================
  * Section 15: Plugin Registration
  * ========================================================================= */
 
@@ -7190,6 +8042,64 @@ static HajimuPluginFunc functions[] = {
     {"リンク",               fn_md_link,           2,  2},
     {"見出し",               fn_md_heading,        2,  2},
     {"リスト",               fn_md_list,           1,  2},
+
+    /* Components V2 (v2.2.0) */
+    {"テキスト表示",         fn_comp_text_display, 2,  2},
+    {"セパレーター",         fn_comp_separator,    1,  3},
+    {"メディアギャラリー",   fn_comp_media_gallery, 2, 2},
+    {"メディアアイテム",     fn_comp_media_item,   1,  2},
+    {"サムネイル",           fn_comp_thumbnail,    2,  3},
+    {"セクション",           fn_comp_section,      2,  3},
+    {"コンテナ",             fn_comp_container,    2,  4},
+    {"ファイル表示",         fn_comp_file,         2,  2},
+    {"V2メッセージ送信",     fn_send_components_v2, 2, 2},
+
+    /* サーバーテンプレート (v2.2.0) */
+    {"テンプレート一覧",     fn_template_list,     1,  1},
+    {"テンプレート取得",     fn_template_get,      1,  1},
+    {"テンプレート作成",     fn_template_create,   2,  3},
+    {"テンプレート同期",     fn_template_sync,     2,  2},
+    {"テンプレート編集",     fn_template_edit,     3,  3},
+    {"テンプレート削除",     fn_template_delete,   2,  2},
+    {"テンプレートからサーバー作成", fn_template_use, 2, 2},
+
+    /* オンボーディング (v2.2.0) */
+    {"オンボーディング取得", fn_onboarding_get,    1,  1},
+    {"オンボーディング設定", fn_onboarding_edit,   2,  2},
+
+    /* サウンドボード (v2.2.0) */
+    {"サウンドボード一覧",   fn_soundboard_list,   1,  1},
+    {"サウンドボード取得",   fn_soundboard_get,    2,  2},
+    {"サウンドボード作成",   fn_soundboard_create, 3,  5},
+    {"サウンドボード編集",   fn_soundboard_edit,   3,  3},
+    {"サウンドボード削除",   fn_soundboard_delete, 2,  2},
+    {"サウンドボード再生",   fn_soundboard_play,   2,  3},
+    {"デフォルトサウンドボード一覧", fn_soundboard_defaults, 0, 0},
+
+    /* ロール接続メタデータ (v2.2.0) */
+    {"ロール接続メタデータ取得",   fn_role_connection_meta_get, 1, 1},
+    {"ロール接続メタデータ設定",   fn_role_connection_meta_set, 2, 2},
+    {"ユーザーロール接続取得",     fn_user_role_connection_get, 1, 1},
+    {"ユーザーロール接続更新",     fn_user_role_connection_set, 2, 2},
+
+    /* エンタイトルメント / SKU (v2.2.0) */
+    {"SKU一覧",              fn_sku_list,                 1,  1},
+    {"エンタイトルメント一覧", fn_entitlement_list,       1,  1},
+    {"エンタイトルメント消費", fn_entitlement_consume,    2,  2},
+    {"テストエンタイトルメント作成", fn_entitlement_test_create, 4, 4},
+    {"テストエンタイトルメント削除", fn_entitlement_test_delete, 2, 2},
+
+    /* OAuth2 (v2.2.0) */
+    {"OAuth2トークン交換",   fn_oauth2_token_exchange,    4,  4},
+    {"OAuth2トークンリフレッシュ", fn_oauth2_token_refresh, 3, 3},
+    {"OAuth2トークン無効化", fn_oauth2_token_revoke,      3,  3},
+    {"OAuth2自分情報",       fn_oauth2_me,                0,  0},
+    {"OAuth2認可URL生成",    fn_oauth2_auth_url,          3,  3},
+
+    /* シャーディング (v2.2.0) */
+    {"シャード設定",         fn_shard_set,                2,  2},
+    {"シャード情報",         fn_shard_info,               0,  0},
+    {"シャードID計算",       fn_shard_id_for,             2,  2},
 
     /* サーバー */
     {"サーバー情報",         fn_guild_info,        1,  1},

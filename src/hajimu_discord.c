@@ -54,7 +54,7 @@
  * ========================================================================= */
 
 #define PLUGIN_NAME    "hajimu_discord"
-#define PLUGIN_VERSION "1.7.0"
+#define PLUGIN_VERSION "1.7.1"
 
 /* Discord API */
 #define DISCORD_API_BASE    "https://discord.com/api/v10"
@@ -801,6 +801,7 @@ static const char b64_table[] =
 static char *base64_encode(const uint8_t *data, int len) {
     int out_len = 4 * ((len + 2) / 3);
     char *out = (char *)malloc(out_len + 1);
+    if (!out) { LOG_E("base64メモリ確保失敗"); return NULL; }
     int i = 0, j = 0;
     while (i < len) {
         uint32_t a = i < len ? data[i++] : 0;
@@ -861,6 +862,10 @@ static JsonNode *discord_rest(const char *method, const char *endpoint,
 
     CurlBuf resp = {NULL, 0};
     resp.data = (char *)calloc(1, REST_BUF_INIT);
+    if (!resp.data) {
+        pthread_mutex_unlock(&g_bot.rest_mutex);
+        return NULL;
+    }
 
     /* Headers */
     struct curl_slist *hdrs = NULL;
@@ -1120,6 +1125,10 @@ static int ws_send_text(WsConn *ws, const char *data, int len) {
 
     /* Masked payload */
     uint8_t *payload = (uint8_t *)malloc(len);
+    if (!payload) {
+        pthread_mutex_unlock(&g_bot.ws_write_mutex);
+        return -1;
+    }
     for (int i = 0; i < len; i++) {
         payload[i] = (uint8_t)data[i] ^ mask[i & 3];
     }
@@ -1199,8 +1208,17 @@ static char *ws_read_message(WsConn *ws) {
 
         /* Read payload */
         if (payload_len > 0) {
+            if (payload_len > 16 * 1024 * 1024) { /* 16MB max payload protection */
+                LOG_E("異常なペイロードサイズ: %llu bytes", (unsigned long long)payload_len);
+                sb_free(&raw);
+                return NULL;
+            }
             uint8_t *buf = (uint8_t *)malloc((size_t)payload_len);
-            uint64_t read_total = 0;
+            if (!buf) {
+                LOG_E("ペイロードメモリ確保失敗");
+                sb_free(&raw);
+                return NULL;
+            }            uint64_t read_total = 0;
             while (read_total < payload_len) {
                 int chunk = (int)(payload_len - read_total);
                 if (chunk > WS_READ_BUF) chunk = WS_READ_BUF;
@@ -1498,6 +1516,11 @@ static Value json_to_value(JsonNode *node) {
             if (count > 0) {
                 dict.dict.keys     = (char **)calloc(count, sizeof(char *));
                 dict.dict.values   = (Value *)calloc(count, sizeof(Value));
+                if (!dict.dict.keys || !dict.dict.values) {
+                    free(dict.dict.keys);
+                    free(dict.dict.values);
+                    return hajimu_null();
+                }
                 dict.dict.length   = count;
                 dict.dict.capacity = count;
                 for (int i = 0; i < count; i++) {
@@ -1893,16 +1916,12 @@ static void gw_handle_dispatch(const char *event_name, JsonNode *data) {
         event_fire("ボイス状態更新", 1, &val);
     } else if (strcmp(event_name, "AUTO_MODERATION_ACTION_EXECUTION") == 0) {
         event_fire("自動モデレーション実行", 1, &val);
-        event_fire("AUTO_MODERATION_ACTION_EXECUTION", 1, &val);
     } else if (strcmp(event_name, "GUILD_SCHEDULED_EVENT_CREATE") == 0) {
         event_fire("イベント作成", 1, &val);
-        event_fire("GUILD_SCHEDULED_EVENT_CREATE", 1, &val);
     } else if (strcmp(event_name, "GUILD_SCHEDULED_EVENT_UPDATE") == 0) {
         event_fire("イベント更新", 1, &val);
-        event_fire("GUILD_SCHEDULED_EVENT_UPDATE", 1, &val);
     } else if (strcmp(event_name, "GUILD_SCHEDULED_EVENT_DELETE") == 0) {
         event_fire("イベント削除", 1, &val);
-        event_fire("GUILD_SCHEDULED_EVENT_DELETE", 1, &val);
     } else if (strcmp(event_name, "RESUMED") == 0) {
         event_fire("再接続完了", 1, &val);
         LOG_I("セッション再開完了");
@@ -2832,17 +2851,15 @@ static Value fn_channel_create(int argc, Value *argv) {
     }
 
     StrBuf sb; sb_init(&sb);
-    sb_append(&sb, "{\"name\":\"");
-    sb_append(&sb, argv[1].string.data);
-    sb_appendf(&sb, "\",\"type\":%d", type);
+    jb_obj_start(&sb);
+    jb_str(&sb, "name", argv[1].string.data);
+    jb_int(&sb, "type", type);
 
     /* Optional 4th arg: parent (category) ID */
     if (argc >= 4 && argv[3].type == VALUE_STRING) {
-        sb_append(&sb, ",\"parent_id\":\"");
-        sb_append(&sb, argv[3].string.data);
-        sb_append(&sb, "\"");
+        jb_str(&sb, "parent_id", argv[3].string.data);
     }
-    sb_append(&sb, "}");
+    jb_obj_end(&sb);
 
     char ep[128];
     snprintf(ep, sizeof(ep), "/guilds/%s/channels", argv[0].string.data);
@@ -2862,8 +2879,7 @@ static Value fn_channel_edit(int argc, Value *argv) {
         argv[1].type != VALUE_DICT) return hajimu_null();
 
     StrBuf sb; sb_init(&sb);
-    sb_append(&sb, "{");
-    bool first = true;
+    jb_obj_start(&sb);
 
     /* Iterate dict keys — use the hajimu runtime dict API */
     int count = argv[1].dict.length;
@@ -2887,21 +2903,17 @@ static Value fn_channel_edit(int argc, Value *argv) {
             api_key = "user_limit";
         else api_key = key;  /* passthrough */
 
-        if (!first) sb_append(&sb, ",");
-        first = false;
-
-        sb_appendf(&sb, "\"%s\":", api_key);
         if (val.type == VALUE_STRING) {
-            sb_appendf(&sb, "\"%s\"", val.string.data);
+            jb_str(&sb, api_key, val.string.data);
         } else if (val.type == VALUE_NUMBER) {
-            sb_appendf(&sb, "%d", (int)val.number);
+            jb_int(&sb, api_key, (int64_t)val.number);
         } else if (val.type == VALUE_BOOL) {
-            sb_append(&sb, val.boolean ? "true" : "false");
+            jb_bool(&sb, api_key, val.boolean);
         } else if (val.type == VALUE_NULL) {
-            sb_append(&sb, "null");
+            jb_null(&sb, api_key);
         }
     }
-    sb_append(&sb, "}");
+    jb_obj_end(&sb);
 
     char ep[64];
     snprintf(ep, sizeof(ep), "/channels/%s", argv[0].string.data);
@@ -2935,8 +2947,11 @@ static Value fn_thread_create(int argc, Value *argv) {
         auto_archive = (int)argv[2].number;
 
     StrBuf sb; sb_init(&sb);
-    sb_appendf(&sb, "{\"name\":\"%s\",\"auto_archive_duration\":%d,\"type\":11}",
-               argv[1].string.data, auto_archive);
+    jb_obj_start(&sb);
+    jb_str(&sb, "name", argv[1].string.data);
+    jb_int(&sb, "auto_archive_duration", auto_archive);
+    jb_int(&sb, "type", 11);
+    jb_obj_end(&sb);
 
     char ep[128];
     snprintf(ep, sizeof(ep), "/channels/%s/threads", argv[0].string.data);
@@ -3037,33 +3052,29 @@ static Value fn_invite_create(int argc, Value *argv) {
     if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_null();
 
     StrBuf sb; sb_init(&sb);
-    sb_append(&sb, "{");
-    bool has_body = false;
+    jb_obj_start(&sb);
 
     if (argc >= 2 && argv[1].type == VALUE_DICT) {
         int count = argv[1].dict.length;
         for (int i = 0; i < count; i++) {
             const char *key = argv[1].dict.keys[i];
             Value val = argv[1].dict.values[i];
-            if (has_body) sb_append(&sb, ",");
 
             if (strcmp(key, "有効期限") == 0 || strcmp(key, "max_age") == 0) {
-                sb_appendf(&sb, "\"max_age\":%d", val.type == VALUE_NUMBER ? (int)val.number : 86400);
+                jb_int(&sb, "max_age", val.type == VALUE_NUMBER ? (int64_t)val.number : 86400);
             } else if (strcmp(key, "最大使用回数") == 0 || strcmp(key, "max_uses") == 0) {
-                sb_appendf(&sb, "\"max_uses\":%d", val.type == VALUE_NUMBER ? (int)val.number : 0);
+                jb_int(&sb, "max_uses", val.type == VALUE_NUMBER ? (int64_t)val.number : 0);
             } else if (strcmp(key, "一時的") == 0 || strcmp(key, "temporary") == 0) {
-                sb_appendf(&sb, "\"temporary\":%s",
-                           (val.type == VALUE_BOOL && val.boolean) ? "true" : "false");
+                jb_bool(&sb, "temporary",
+                        (val.type == VALUE_BOOL && val.boolean));
             } else {
-                sb_appendf(&sb, "\"%s\":", key);
-                if (val.type == VALUE_NUMBER) sb_appendf(&sb, "%d", (int)val.number);
-                else if (val.type == VALUE_BOOL) sb_append(&sb, val.boolean ? "true" : "false");
-                else if (val.type == VALUE_STRING) sb_appendf(&sb, "\"%s\"", val.string.data);
+                if (val.type == VALUE_NUMBER) jb_int(&sb, key, (int64_t)val.number);
+                else if (val.type == VALUE_BOOL) jb_bool(&sb, key, val.boolean);
+                else if (val.type == VALUE_STRING) jb_str(&sb, key, val.string.data);
             }
-            has_body = true;
         }
     }
-    sb_append(&sb, "}");
+    jb_obj_end(&sb);
 
     char ep[128];
     snprintf(ep, sizeof(ep), "/channels/%s/invites", argv[0].string.data);
@@ -3227,7 +3238,9 @@ static Value fn_webhook_create(int argc, Value *argv) {
     char ep[128];
     snprintf(ep, sizeof(ep), "/channels/%s/webhooks", argv[0].string.data);
     StrBuf sb; sb_init(&sb);
-    sb_appendf(&sb, "{\"name\":\"%s\"}", argv[1].string.data);
+    jb_obj_start(&sb);
+    jb_str(&sb, "name", argv[1].string.data);
+    jb_obj_end(&sb);
     long code = 0;
     JsonNode *resp = discord_rest("POST", ep, sb.data, &code);
     sb_free(&sb);
@@ -3268,14 +3281,15 @@ static Value fn_webhook_send(int argc, Value *argv) {
         argv[1].type != VALUE_STRING) return hajimu_null();
 
     StrBuf sb; sb_init(&sb);
-    sb_appendf(&sb, "{\"content\":\"%s\"", argv[1].string.data);
+    jb_obj_start(&sb);
+    jb_str(&sb, "content", argv[1].string.data);
     if (argc >= 3 && argv[2].type == VALUE_STRING) {
-        sb_appendf(&sb, ",\"username\":\"%s\"", argv[2].string.data);
+        jb_str(&sb, "username", argv[2].string.data);
     }
     if (argc >= 4 && argv[3].type == VALUE_STRING) {
-        sb_appendf(&sb, ",\"avatar_url\":\"%s\"", argv[3].string.data);
+        jb_str(&sb, "avatar_url", argv[3].string.data);
     }
-    sb_append(&sb, "}");
+    jb_obj_end(&sb);
 
     long code = 0;
     /* Webhook URLs are full URLs, use webhook_rest */
@@ -3296,11 +3310,11 @@ static Value fn_send_file(int argc, Value *argv) {
 
     /* Build JSON payload */
     StrBuf sb; sb_init(&sb);
-    sb_append(&sb, "{");
+    jb_obj_start(&sb);
     if (argc >= 3 && argv[2].type == VALUE_STRING) {
-        sb_appendf(&sb, "\"content\":\"%s\"", argv[2].string.data);
+        jb_str(&sb, "content", argv[2].string.data);
     }
-    sb_append(&sb, "}");
+    jb_obj_end(&sb);
 
     char ep[128];
     snprintf(ep, sizeof(ep), "/channels/%s/messages", argv[0].string.data);
@@ -3365,20 +3379,15 @@ static Value fn_ban(int argc, Value *argv) {
     snprintf(ep, sizeof(ep), "/guilds/%s/bans/%s",
              argv[0].string.data, argv[1].string.data);
 
-    const char *body = "{}";
-    StrBuf sb;
-    if (argc >= 3 && argv[2].type == VALUE_STRING) {
-        sb_init(&sb);
-        jb_obj_start(&sb);
-        jb_int(&sb, "delete_message_seconds", 0);
-        jb_obj_end(&sb);
-        body = sb.data;
-    }
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    jb_int(&sb, "delete_message_seconds", 0);
+    jb_obj_end(&sb);
 
     long code = 0;
-    JsonNode *resp = discord_rest("PUT", ep, body, &code);
+    JsonNode *resp = discord_rest("PUT", ep, sb.data, &code);
     if (resp) { json_free(resp); free(resp); }
-    if (argc >= 3) sb_free(&sb);
+    sb_free(&sb);
     return hajimu_bool(code == 204);
 }
 
@@ -4989,14 +4998,10 @@ static Value fn_automod_delete(int argc, Value *argv) {
 
 /* AutoMod実行時 — イベント登録ショートカット */
 static Value fn_automod_on_action(int argc, Value *argv) {
-    if (argc < 1 || argv[0].type != VALUE_FUNCTION) return hajimu_null();
-    EventEntry *e = event_find("自動モデレーション実行");
-    if (!e) {
-        e = event_find(NULL); /* first free slot via event_register */
-        event_register("自動モデレーション実行", argv[0]);
-    } else if (e->handler_count < MAX_HANDLERS) {
-        e->handlers[e->handler_count++] = argv[0];
-    }
+    if (argc < 1 || (argv[0].type != VALUE_FUNCTION && argv[0].type != VALUE_BUILTIN))
+        return hajimu_bool(false);
+    event_register("自動モデレーション実行", argv[0]);
+    event_register("AUTO_MODERATION_ACTION_EXECUTION", argv[0]);
     return hajimu_bool(true);
 }
 
@@ -5037,8 +5042,18 @@ static Value fn_emoji_create(int argc, Value *argv) {
         return hajimu_null();
     }
     uint8_t *img = (uint8_t *)malloc(fsize);
-    fread(img, 1, fsize, fp);
+    if (!img) {
+        fclose(fp);
+        LOG_E("絵文字画像メモリ確保失敗");
+        return hajimu_null();
+    }
+    size_t read_bytes = fread(img, 1, fsize, fp);
     fclose(fp);
+    if ((long)read_bytes != fsize) {
+        free(img);
+        LOG_E("絵文字画像読み込み失敗");
+        return hajimu_null();
+    }
 
     /* Detect content type from extension */
     const char *path = argv[2].string.data;
@@ -5053,6 +5068,10 @@ static Value fn_emoji_create(int argc, Value *argv) {
 
     char *b64 = base64_encode(img, (int)fsize);
     free(img);
+    if (!b64) {
+        LOG_E("絵文字Base64エンコード失敗");
+        return hajimu_null();
+    }
 
     /* Build data URI: "data:image/png;base64,XXXX" */
     StrBuf sb; sb_init(&sb);

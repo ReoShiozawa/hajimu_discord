@@ -1,6 +1,6 @@
 {
   "名前": "hajimu_discord",
-  "バージョン": "1.7.0",
+  "バージョン": "1.7.1",
   "説明": "はじむ言語用 Discord Bot 開発プラグイン — Gateway v10 / REST v10 対応",
   "作者": "はじむ開発チーム",
   "メイン": "hajimu_discord.hjp",

@@ -2,7 +2,7 @@
   <img src="https://img.shields.io/badge/言語-はじむ-ff6b6b?style=for-the-badge" alt="はじむ">
   <img src="https://img.shields.io/badge/Discord_API-v10-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord API v10">
   <img src="https://img.shields.io/badge/license-MIT-green?style=for-the-badge" alt="MIT License">
-  <img src="https://img.shields.io/badge/version-1.7.0-blue?style=for-the-badge" alt="v1.7.0">
+  <img src="https://img.shields.io/badge/version-1.7.1-blue?style=for-the-badge" alt="v1.7.1">
 </p>
 
 # hajimu_discord — はじむ言語用 Discord Bot 開発プラグイン
@@ -908,6 +908,19 @@ v1.0.0 では未対応です。v2.0 で対応予定です。
 ---
 
 ## 📜 変更履歴
+
+### v1.7.1 (2026-02-14)
+
+**セキュリティ修正 & バグ修正**
+
+- **[セキュリティ]** JSONインジェクション脆弱性を修正 — チャンネル作成/編集/スレッド作成/招待作成/Webhook作成・送信/ファイル送信 で `json_escape_str` を使用するように変更
+- **[セキュリティ]** WebSocket ペイロード長チェック追加 (16MB上限) — DoS攻撃防止
+- **[バグ修正]** `AutoMod実行時` 関数の `event_find(NULL)` による未定義動作・クラッシュを修正
+- **[バグ修正]** `BAN` 関数の未初期化 `StrBuf` 解放によるクラッシュを修正
+- **[バグ修正]** AUTO_MODERATION / GUILD_SCHEDULED_EVENT 系イベントの二重発火を修正
+- **[堅牢性]** `malloc`/`calloc` NULL チェック追加: base64_encode、WebSocket送受信、JSON変換、REST API、絵文字読み込み
+- **[堅牢性]** `fn_emoji_create` の `fread` 戻り値チェック追加
+- 累計 ~124 関数（変更なし）
 
 ### v1.7.0 (2026-02-14)
 

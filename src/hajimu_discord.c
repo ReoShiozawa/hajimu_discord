@@ -16,6 +16,7 @@
  * v1.4.0 — 2026-02-14  チャンネル管理・スレッド・権限オーバーライド・招待
  * v1.5.0 — 2026-02-14  Webhook・ファイル添付
  * v1.6.0 — 2026-02-14  コレクター・メンバーキャッシュ・サーバー一覧
+ * v1.7.0 — 2026-02-14  監査ログ・AutoModeration・絵文字・スケジュールイベント・投票
  */
 
 #define _GNU_SOURCE
@@ -53,7 +54,7 @@
  * ========================================================================= */
 
 #define PLUGIN_NAME    "hajimu_discord"
-#define PLUGIN_VERSION "1.6.0"
+#define PLUGIN_VERSION "1.7.0"
 
 /* Discord API */
 #define DISCORD_API_BASE    "https://discord.com/api/v10"
@@ -1429,6 +1430,42 @@ static const KeyMap key_map[] = {
     {"reason",            "理由"},
     {"count",             "数"},
     {"me",                "自分"},
+    /* v1.7.0: 監査ログ / AutoMod / 絵文字 / イベント / 投票 */
+    {"action_type",       "アクション種類"},
+    {"target_id",         "対象ID"},
+    {"changes",           "変更内容"},
+    {"rule_id",           "ルールID"},
+    {"rule_trigger_type", "トリガー種類"},
+    {"matched_keyword",   "一致キーワード"},
+    {"matched_content",   "一致内容"},
+    {"alert_system_message_id", "アラートメッセージID"},
+    {"keyword_filter",    "キーワードフィルタ"},
+    {"trigger_type",      "トリガー種類"},
+    {"trigger_metadata",  "トリガーメタ"},
+    {"event_type",        "イベント種類"},
+    {"actions",           "アクション"},
+    {"enabled",           "有効"},
+    {"exempt_roles",      "除外ロール"},
+    {"exempt_channels",   "除外チャンネル"},
+    {"animated",          "アニメーション"},
+    {"available",         "利用可能"},
+    {"managed",           "管理済み"},
+    {"require_colons",    "コロン必要"},
+    {"scheduled_start_time", "開始時刻"},
+    {"scheduled_end_time","終了時刻"},
+    {"entity_type",       "エンティティ種類"},
+    {"privacy_level",     "プライバシー"},
+    {"status",            "ステータス"},
+    {"entity_metadata",   "エンティティメタ"},
+    {"creator",           "作成者"},
+    {"user_count",        "参加者数"},
+    {"question",          "質問"},
+    {"answers",           "回答"},
+    {"expiry",            "期限"},
+    {"allow_multiselect", "複数選択"},
+    {"poll",              "投票"},
+    {"results",           "結果"},
+    {"layout_type",       "レイアウト"},
     {NULL, NULL}
 };
 
@@ -1854,6 +1891,18 @@ static void gw_handle_dispatch(const char *event_name, JsonNode *data) {
         event_fire("プレゼンス更新", 1, &val);
     } else if (strcmp(event_name, "VOICE_STATE_UPDATE") == 0) {
         event_fire("ボイス状態更新", 1, &val);
+    } else if (strcmp(event_name, "AUTO_MODERATION_ACTION_EXECUTION") == 0) {
+        event_fire("自動モデレーション実行", 1, &val);
+        event_fire("AUTO_MODERATION_ACTION_EXECUTION", 1, &val);
+    } else if (strcmp(event_name, "GUILD_SCHEDULED_EVENT_CREATE") == 0) {
+        event_fire("イベント作成", 1, &val);
+        event_fire("GUILD_SCHEDULED_EVENT_CREATE", 1, &val);
+    } else if (strcmp(event_name, "GUILD_SCHEDULED_EVENT_UPDATE") == 0) {
+        event_fire("イベント更新", 1, &val);
+        event_fire("GUILD_SCHEDULED_EVENT_UPDATE", 1, &val);
+    } else if (strcmp(event_name, "GUILD_SCHEDULED_EVENT_DELETE") == 0) {
+        event_fire("イベント削除", 1, &val);
+        event_fire("GUILD_SCHEDULED_EVENT_DELETE", 1, &val);
     } else if (strcmp(event_name, "RESUMED") == 0) {
         event_fire("再接続完了", 1, &val);
         LOG_I("セッション再開完了");
@@ -4694,6 +4743,550 @@ static Value fn_guild_list(int argc, Value *argv) {
 }
 
 /* =========================================================================
+ * v1.7.0: 監査ログ・AutoModeration・絵文字・スケジュールイベント・投票
+ * ========================================================================= */
+
+/* --- 監査ログ --- */
+
+/* 監査ログ(サーバーID[, 種類, 件数])
+ * GET /guilds/{id}/audit-logs?action_type=N&limit=N */
+static Value fn_audit_log(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_null();
+    char ep[256];
+    int offset = 0;
+    offset += snprintf(ep + offset, sizeof(ep) - offset,
+                       "/guilds/%s/audit-logs", argv[0].string.data);
+    bool has_param = false;
+    if (argc >= 2 && argv[1].type == VALUE_NUMBER) {
+        offset += snprintf(ep + offset, sizeof(ep) - offset,
+                           "?action_type=%d", (int)argv[1].number);
+        has_param = true;
+    }
+    if (argc >= 3 && argv[2].type == VALUE_NUMBER) {
+        int limit = (int)argv[2].number;
+        if (limit < 1) limit = 1;
+        if (limit > 100) limit = 100;
+        offset += snprintf(ep + offset, sizeof(ep) - offset,
+                           "%slimit=%d", has_param ? "&" : "?", limit);
+    }
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", ep, NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* --- AutoModeration --- */
+
+/* Helper: serialize Value array of strings to JSON array string */
+static void serialize_string_array(StrBuf *sb, Value *arr) {
+    jb_arr_start(sb);
+    if (arr->type == VALUE_ARRAY) {
+        for (int i = 0; i < arr->array.length; i++) {
+            if (arr->array.elements[i].type == VALUE_STRING) {
+                json_escape_str(sb, arr->array.elements[i].string.data);
+                sb_append_char(sb, ',');
+            }
+        }
+    }
+    jb_arr_end(sb);
+}
+
+/* AutoModルール一覧(サーバーID) */
+static Value fn_automod_list(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_null();
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/guilds/%s/auto-moderation/rules",
+             argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", ep, NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* AutoModルール取得(サーバーID, ルールID) */
+static Value fn_automod_get(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING ||
+        argv[1].type != VALUE_STRING) return hajimu_null();
+    char ep[160];
+    snprintf(ep, sizeof(ep), "/guilds/%s/auto-moderation/rules/%s",
+             argv[0].string.data, argv[1].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", ep, NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* AutoModルール作成(サーバーID, 設定辞書)
+ * 設定: {
+ *   "名前": "ルール名",
+ *   "トリガー種類": 1,  -- 1=キーワード, 3=スパム, 4=キーワードプリセット, 5=メンション
+ *   "キーワード": ["bad", "evil"],
+ *   "アクション種類": 1,  -- 1=ブロック, 2=アラート送信, 3=タイムアウト
+ *   "アラートチャンネル": "channel_id",
+ *   "タイムアウト秒数": 60,
+ *   "有効": true
+ * } */
+static Value fn_automod_create(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING ||
+        argv[1].type != VALUE_DICT) return hajimu_null();
+
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+
+    int trigger_type = 1;
+    int action_type = 1;
+    const char *alert_channel = NULL;
+    int timeout_secs = 0;
+    Value *keywords = NULL;
+
+    int count = argv[1].dict.length;
+    for (int i = 0; i < count; i++) {
+        const char *key = argv[1].dict.keys[i];
+        Value val = argv[1].dict.values[i];
+
+        if (strcmp(key, "名前") == 0 || strcmp(key, "name") == 0) {
+            if (val.type == VALUE_STRING) jb_str(&sb, "name", val.string.data);
+        } else if (strcmp(key, "トリガー種類") == 0 || strcmp(key, "trigger_type") == 0) {
+            if (val.type == VALUE_NUMBER) trigger_type = (int)val.number;
+        } else if (strcmp(key, "キーワード") == 0 || strcmp(key, "keywords") == 0) {
+            keywords = &argv[1].dict.values[i];
+        } else if (strcmp(key, "アクション種類") == 0 || strcmp(key, "action_type") == 0) {
+            if (val.type == VALUE_NUMBER) action_type = (int)val.number;
+        } else if (strcmp(key, "アラートチャンネル") == 0 || strcmp(key, "alert_channel") == 0) {
+            if (val.type == VALUE_STRING) alert_channel = val.string.data;
+        } else if (strcmp(key, "タイムアウト秒数") == 0 || strcmp(key, "timeout_seconds") == 0) {
+            if (val.type == VALUE_NUMBER) timeout_secs = (int)val.number;
+        } else if (strcmp(key, "有効") == 0 || strcmp(key, "enabled") == 0) {
+            if (val.type == VALUE_BOOL) jb_bool(&sb, "enabled", val.boolean);
+        }
+    }
+
+    jb_int(&sb, "trigger_type", trigger_type);
+    jb_int(&sb, "event_type", 1); /* MESSAGE_SEND */
+
+    /* trigger_metadata */
+    if (keywords && keywords->type == VALUE_ARRAY) {
+        jb_key(&sb, "trigger_metadata");
+        jb_obj_start(&sb);
+        jb_key(&sb, "keyword_filter");
+        serialize_string_array(&sb, keywords);
+        sb_append_char(&sb, ',');
+        jb_obj_end(&sb);
+        sb_append_char(&sb, ',');
+    }
+
+    /* actions array */
+    jb_key(&sb, "actions");
+    jb_arr_start(&sb);
+    jb_obj_start(&sb);
+    jb_int(&sb, "type", action_type);
+    if (action_type == 2 && alert_channel) {
+        jb_key(&sb, "metadata");
+        jb_obj_start(&sb);
+        jb_str(&sb, "channel_id", alert_channel);
+        jb_obj_end(&sb);
+        sb_append_char(&sb, ',');
+    } else if (action_type == 3 && timeout_secs > 0) {
+        jb_key(&sb, "metadata");
+        jb_obj_start(&sb);
+        jb_int(&sb, "duration_seconds", timeout_secs);
+        jb_obj_end(&sb);
+        sb_append_char(&sb, ',');
+    }
+    jb_obj_end(&sb);
+    sb_append_char(&sb, ',');
+    jb_arr_end(&sb);
+    sb_append_char(&sb, ',');
+
+    jb_obj_end(&sb);
+
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/guilds/%s/auto-moderation/rules",
+             argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("POST", ep, sb.data, &code);
+    sb_free(&sb);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* AutoModルール編集(サーバーID, ルールID, 設定辞書) */
+static Value fn_automod_edit(int argc, Value *argv) {
+    if (argc < 3 || argv[0].type != VALUE_STRING ||
+        argv[1].type != VALUE_STRING ||
+        argv[2].type != VALUE_DICT) return hajimu_null();
+
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+
+    int count = argv[2].dict.length;
+    for (int i = 0; i < count; i++) {
+        const char *key = argv[2].dict.keys[i];
+        Value val = argv[2].dict.values[i];
+
+        if (strcmp(key, "名前") == 0 || strcmp(key, "name") == 0) {
+            if (val.type == VALUE_STRING) jb_str(&sb, "name", val.string.data);
+        } else if (strcmp(key, "有効") == 0 || strcmp(key, "enabled") == 0) {
+            if (val.type == VALUE_BOOL) jb_bool(&sb, "enabled", val.boolean);
+        } else if (strcmp(key, "キーワード") == 0 || strcmp(key, "keywords") == 0) {
+            if (val.type == VALUE_ARRAY) {
+                jb_key(&sb, "trigger_metadata");
+                jb_obj_start(&sb);
+                jb_key(&sb, "keyword_filter");
+                serialize_string_array(&sb, &argv[2].dict.values[i]);
+                sb_append_char(&sb, ',');
+                jb_obj_end(&sb);
+                sb_append_char(&sb, ',');
+            }
+        } else if (strcmp(key, "アクション種類") == 0 || strcmp(key, "action_type") == 0) {
+            if (val.type == VALUE_NUMBER) {
+                jb_key(&sb, "actions");
+                jb_arr_start(&sb);
+                jb_obj_start(&sb);
+                jb_int(&sb, "type", (int)val.number);
+                jb_obj_end(&sb);
+                sb_append_char(&sb, ',');
+                jb_arr_end(&sb);
+                sb_append_char(&sb, ',');
+            }
+        }
+    }
+
+    jb_obj_end(&sb);
+
+    char ep[160];
+    snprintf(ep, sizeof(ep), "/guilds/%s/auto-moderation/rules/%s",
+             argv[0].string.data, argv[1].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("PATCH", ep, sb.data, &code);
+    sb_free(&sb);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* AutoModルール削除(サーバーID, ルールID) */
+static Value fn_automod_delete(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING ||
+        argv[1].type != VALUE_STRING) return hajimu_bool(false);
+    char ep[160];
+    snprintf(ep, sizeof(ep), "/guilds/%s/auto-moderation/rules/%s",
+             argv[0].string.data, argv[1].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("DELETE", ep, NULL, &code);
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code == 204);
+}
+
+/* AutoMod実行時 — イベント登録ショートカット */
+static Value fn_automod_on_action(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_FUNCTION) return hajimu_null();
+    EventEntry *e = event_find("自動モデレーション実行");
+    if (!e) {
+        e = event_find(NULL); /* first free slot via event_register */
+        event_register("自動モデレーション実行", argv[0]);
+    } else if (e->handler_count < MAX_HANDLERS) {
+        e->handlers[e->handler_count++] = argv[0];
+    }
+    return hajimu_bool(true);
+}
+
+/* --- 絵文字管理 --- */
+
+/* 絵文字一覧(サーバーID) */
+static Value fn_emoji_list(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_null();
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/guilds/%s/emojis", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", ep, NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* 絵文字作成(サーバーID, 名前, 画像パス)
+ * 画像をBase64エンコードしてPOST /guilds/{id}/emojis */
+static Value fn_emoji_create(int argc, Value *argv) {
+    if (argc < 3 || argv[0].type != VALUE_STRING ||
+        argv[1].type != VALUE_STRING ||
+        argv[2].type != VALUE_STRING) return hajimu_null();
+
+    /* Read image file */
+    FILE *fp = fopen(argv[2].string.data, "rb");
+    if (!fp) {
+        LOG_E("絵文字画像を開けません: %s", argv[2].string.data);
+        return hajimu_null();
+    }
+    fseek(fp, 0, SEEK_END);
+    long fsize = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    if (fsize <= 0 || fsize > 256 * 1024) { /* Discord emoji max 256KB */
+        fclose(fp);
+        LOG_E("絵文字画像サイズ不正: %ld bytes", fsize);
+        return hajimu_null();
+    }
+    uint8_t *img = (uint8_t *)malloc(fsize);
+    fread(img, 1, fsize, fp);
+    fclose(fp);
+
+    /* Detect content type from extension */
+    const char *path = argv[2].string.data;
+    const char *ext = strrchr(path, '.');
+    const char *mime = "image/png";
+    if (ext) {
+        if (strcasecmp(ext, ".gif") == 0) mime = "image/gif";
+        else if (strcasecmp(ext, ".jpg") == 0 || strcasecmp(ext, ".jpeg") == 0)
+            mime = "image/jpeg";
+        else if (strcasecmp(ext, ".webp") == 0) mime = "image/webp";
+    }
+
+    char *b64 = base64_encode(img, (int)fsize);
+    free(img);
+
+    /* Build data URI: "data:image/png;base64,XXXX" */
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    jb_str(&sb, "name", argv[1].string.data);
+    jb_key(&sb, "image");
+    sb_append(&sb, "\"data:");
+    sb_append(&sb, mime);
+    sb_append(&sb, ";base64,");
+    sb_append(&sb, b64);
+    sb_append(&sb, "\",");
+    jb_obj_end(&sb);
+    free(b64);
+
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/guilds/%s/emojis", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("POST", ep, sb.data, &code);
+    sb_free(&sb);
+    Value result = hajimu_null();
+    if (resp && code == 201) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* 絵文字削除(サーバーID, 絵文字ID) */
+static Value fn_emoji_delete(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING ||
+        argv[1].type != VALUE_STRING) return hajimu_bool(false);
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/guilds/%s/emojis/%s",
+             argv[0].string.data, argv[1].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("DELETE", ep, NULL, &code);
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code == 204);
+}
+
+/* --- スケジュールイベント --- */
+
+/* イベント作成(サーバーID, 名前, 開始時刻, 終了時刻[, 説明])
+ * 開始/終了: ISO 8601 文字列 (例: "2026-03-01T18:00:00Z")
+ * entity_type: 3 = EXTERNAL (場所指定あり) */
+static Value fn_event_create(int argc, Value *argv) {
+    if (argc < 4 || argv[0].type != VALUE_STRING ||
+        argv[1].type != VALUE_STRING ||
+        argv[2].type != VALUE_STRING ||
+        argv[3].type != VALUE_STRING) return hajimu_null();
+
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    jb_str(&sb, "name", argv[1].string.data);
+    jb_str(&sb, "scheduled_start_time", argv[2].string.data);
+    jb_str(&sb, "scheduled_end_time", argv[3].string.data);
+    jb_int(&sb, "privacy_level", 2); /* GUILD_ONLY */
+    jb_int(&sb, "entity_type", 3);   /* EXTERNAL */
+
+    /* entity_metadata with location */
+    jb_key(&sb, "entity_metadata");
+    jb_obj_start(&sb);
+    jb_str(&sb, "location", "オンライン");
+    jb_obj_end(&sb);
+    sb_append_char(&sb, ',');
+
+    if (argc >= 5 && argv[4].type == VALUE_STRING) {
+        jb_str(&sb, "description", argv[4].string.data);
+    }
+    jb_obj_end(&sb);
+
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/guilds/%s/scheduled-events",
+             argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("POST", ep, sb.data, &code);
+    sb_free(&sb);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* イベント編集(サーバーID, イベントID, 設定辞書)
+ * 設定: {"名前": "...", "説明": "...", "開始": "...", "終了": "...", "ステータス": 2} */
+static Value fn_event_edit(int argc, Value *argv) {
+    if (argc < 3 || argv[0].type != VALUE_STRING ||
+        argv[1].type != VALUE_STRING ||
+        argv[2].type != VALUE_DICT) return hajimu_null();
+
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+
+    int count = argv[2].dict.length;
+    for (int i = 0; i < count; i++) {
+        const char *key = argv[2].dict.keys[i];
+        Value val = argv[2].dict.values[i];
+        if (strcmp(key, "名前") == 0 || strcmp(key, "name") == 0) {
+            if (val.type == VALUE_STRING) jb_str(&sb, "name", val.string.data);
+        } else if (strcmp(key, "説明") == 0 || strcmp(key, "description") == 0) {
+            if (val.type == VALUE_STRING) jb_str(&sb, "description", val.string.data);
+        } else if (strcmp(key, "開始") == 0 || strcmp(key, "scheduled_start_time") == 0) {
+            if (val.type == VALUE_STRING) jb_str(&sb, "scheduled_start_time", val.string.data);
+        } else if (strcmp(key, "終了") == 0 || strcmp(key, "scheduled_end_time") == 0) {
+            if (val.type == VALUE_STRING) jb_str(&sb, "scheduled_end_time", val.string.data);
+        } else if (strcmp(key, "ステータス") == 0 || strcmp(key, "status") == 0) {
+            if (val.type == VALUE_NUMBER) jb_int(&sb, "status", (int)val.number);
+        }
+    }
+
+    jb_obj_end(&sb);
+
+    char ep[160];
+    snprintf(ep, sizeof(ep), "/guilds/%s/scheduled-events/%s",
+             argv[0].string.data, argv[1].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("PATCH", ep, sb.data, &code);
+    sb_free(&sb);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* イベント削除(サーバーID, イベントID) */
+static Value fn_event_delete(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING ||
+        argv[1].type != VALUE_STRING) return hajimu_bool(false);
+    char ep[160];
+    snprintf(ep, sizeof(ep), "/guilds/%s/scheduled-events/%s",
+             argv[0].string.data, argv[1].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("DELETE", ep, NULL, &code);
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code == 204);
+}
+
+/* イベント一覧(サーバーID) */
+static Value fn_event_list(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_null();
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/guilds/%s/scheduled-events",
+             argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", ep, NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* --- 投票 (Poll) --- */
+
+/* 投票作成(チャンネルID, 質問, 選択肢配列, 時間(h))
+ * 選択肢配列: ["選択肢1", "選択肢2", ...]
+ * 時間: 投票期間（時間単位、1-168） */
+static Value fn_poll_create(int argc, Value *argv) {
+    if (argc < 4 || argv[0].type != VALUE_STRING ||
+        argv[1].type != VALUE_STRING ||
+        argv[2].type != VALUE_ARRAY ||
+        argv[3].type != VALUE_NUMBER) return hajimu_null();
+
+    int duration = (int)argv[3].number;
+    if (duration < 1) duration = 1;
+    if (duration > 168) duration = 168; /* max 7 days */
+
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+
+    /* poll object */
+    jb_key(&sb, "poll");
+    jb_obj_start(&sb);
+
+    /* question */
+    jb_key(&sb, "question");
+    jb_obj_start(&sb);
+    jb_str(&sb, "text", argv[1].string.data);
+    jb_obj_end(&sb);
+    sb_append_char(&sb, ',');
+
+    /* answers array */
+    jb_key(&sb, "answers");
+    jb_arr_start(&sb);
+    for (int i = 0; i < argv[2].array.length && i < 10; i++) {
+        Value *item = &argv[2].array.elements[i];
+        if (item->type == VALUE_STRING) {
+            jb_obj_start(&sb);
+            jb_key(&sb, "poll_media");
+            jb_obj_start(&sb);
+            jb_str(&sb, "text", item->string.data);
+            jb_obj_end(&sb);
+            sb_append_char(&sb, ',');
+            jb_obj_end(&sb);
+            sb_append_char(&sb, ',');
+        }
+    }
+    jb_arr_end(&sb);
+    sb_append_char(&sb, ',');
+
+    jb_int(&sb, "duration", duration);
+    jb_bool(&sb, "allow_multiselect",
+            (argc >= 5 && argv[4].type == VALUE_BOOL) ? argv[4].boolean : false);
+    jb_int(&sb, "layout_type", 1); /* DEFAULT */
+
+    jb_obj_end(&sb);
+    sb_append_char(&sb, ',');
+
+    jb_obj_end(&sb);
+
+    char ep[64];
+    snprintf(ep, sizeof(ep), "/channels/%s/messages", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("POST", ep, sb.data, &code);
+    sb_free(&sb);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* 投票終了(チャンネルID, メッセージID) — POST /channels/{id}/polls/{msg}/expire */
+static Value fn_poll_end(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING ||
+        argv[1].type != VALUE_STRING) return hajimu_null();
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/channels/%s/polls/%s/expire",
+             argv[0].string.data, argv[1].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("POST", ep, NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* =========================================================================
  * Section 15: Plugin Registration
  * ========================================================================= */
 
@@ -4828,6 +5421,24 @@ static HajimuPluginFunc functions[] = {
 
     /* サーバー一覧 (v1.6.0) */
     {"サーバー一覧",         fn_guild_list,        0,  0},
+
+    /* v1.7.0: 監査ログ・AutoMod・絵文字・イベント・投票 */
+    {"監査ログ",             fn_audit_log,         1,  3},
+    {"AutoModルール一覧",    fn_automod_list,      1,  1},
+    {"AutoModルール取得",    fn_automod_get,       2,  2},
+    {"AutoModルール作成",    fn_automod_create,    2,  2},
+    {"AutoModルール編集",    fn_automod_edit,      3,  3},
+    {"AutoModルール削除",    fn_automod_delete,    2,  2},
+    {"AutoMod実行時",        fn_automod_on_action, 1,  1},
+    {"絵文字一覧",           fn_emoji_list,        1,  1},
+    {"絵文字作成",           fn_emoji_create,      3,  3},
+    {"絵文字削除",           fn_emoji_delete,      2,  2},
+    {"イベント作成",         fn_event_create,      4,  5},
+    {"イベント編集",         fn_event_edit,        3,  3},
+    {"イベント削除",         fn_event_delete,      2,  2},
+    {"イベント一覧",         fn_event_list,        1,  1},
+    {"投票作成",             fn_poll_create,       4,  5},
+    {"投票終了",             fn_poll_end,          2,  2},
 
     /* サーバー */
     {"サーバー情報",         fn_guild_info,        1,  1},

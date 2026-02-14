@@ -19,6 +19,7 @@
  * v1.7.0 — 2026-02-14  監査ログ・AutoModeration・絵文字・スケジュールイベント・投票
  * v1.7.1 — 2026-02-14  セキュリティ修正・バグ修正
  * v2.0.0 — 2026-02-14  ボイスチャンネル対応 (Opus/Sodium)
+ * v2.1.0 — 2026-02-14  ステージチャンネル・スタンプ・サーバー編集・Markdownユーティリティ
  */
 
 #define _GNU_SOURCE
@@ -60,7 +61,7 @@
  * ========================================================================= */
 
 #define PLUGIN_NAME    "hajimu_discord"
-#define PLUGIN_VERSION "2.0.0"
+#define PLUGIN_VERSION "2.1.0"
 
 /* Discord API */
 #define DISCORD_API_BASE    "https://discord.com/api/v10"
@@ -6478,6 +6479,507 @@ static Value fn_voice_volume(int argc, Value *argv) {
 }
 
 /* =========================================================================
+ * v2.1.0: ステージチャンネル・スタンプ・サーバー編集・フォーラム・Markdown
+ * ========================================================================= */
+
+/* --- ステージチャンネル管理 --- */
+
+/* ステージ開始(チャンネルID, トピック[, 公開]) — Create Stage Instance */
+static Value fn_stage_start(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING) {
+        LOG_E("ステージ開始: チャンネルID(文字列), トピック(文字列)が必要です");
+        return hajimu_null();
+    }
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    jb_str(&sb, "channel_id", argv[0].string.data);
+    jb_str(&sb, "topic", argv[1].string.data);
+    /* privacy_level: 1=PUBLIC, 2=GUILD_ONLY (default) */
+    int privacy = 2;
+    if (argc >= 3 && argv[2].type == VALUE_BOOL && argv[2].boolean) privacy = 1;
+    jb_int(&sb, "privacy_level", privacy);
+    jb_obj_end(&sb);
+
+    long code = 0;
+    JsonNode *resp = discord_rest("POST", "/stage-instances", sb.data, &code);
+    sb_free(&sb);
+    Value result = hajimu_null();
+    if (resp && (code == 200 || code == 201)) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    LOG_I("ステージ開始: channel=%s", argv[0].string.data);
+    return result;
+}
+
+/* ステージ編集(チャンネルID, トピック) — Modify Stage Instance */
+static Value fn_stage_edit(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING) {
+        LOG_E("ステージ編集: チャンネルID(文字列), トピック(文字列)が必要です");
+        return hajimu_bool(false);
+    }
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    jb_str(&sb, "topic", argv[1].string.data);
+    jb_obj_end(&sb);
+
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/stage-instances/%s", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("PATCH", ep, sb.data, &code);
+    sb_free(&sb);
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code == 200);
+}
+
+/* ステージ終了(チャンネルID) — Delete Stage Instance */
+static Value fn_stage_end(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) {
+        LOG_E("ステージ終了: チャンネルID(文字列)が必要です");
+        return hajimu_bool(false);
+    }
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/stage-instances/%s", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("DELETE", ep, NULL, &code);
+    if (resp) { json_free(resp); free(resp); }
+    LOG_I("ステージ終了: channel=%s", argv[0].string.data);
+    return hajimu_bool(code == 204);
+}
+
+/* ステージ情報(チャンネルID) — Get Stage Instance */
+static Value fn_stage_info(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_null();
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/stage-instances/%s", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", ep, NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* --- スタンプ管理 --- */
+
+/* スタンプ一覧(サーバーID) — List Guild Stickers */
+static Value fn_sticker_list(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_array();
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/guilds/%s/stickers", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", ep, NULL, &code);
+    Value result = hajimu_array();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* スタンプ取得(サーバーID, スタンプID) — Get Guild Sticker */
+static Value fn_sticker_get(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING)
+        return hajimu_null();
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/guilds/%s/stickers/%s",
+             argv[0].string.data, argv[1].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", ep, NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* スタンプ作成(サーバーID, 名前, ファイルパス[, 説明, タグ]) — Create Guild Sticker */
+static Value fn_sticker_create(int argc, Value *argv) {
+    if (argc < 3 || argv[0].type != VALUE_STRING ||
+        argv[1].type != VALUE_STRING || argv[2].type != VALUE_STRING) {
+        LOG_E("スタンプ作成: サーバーID, 名前, ファイルパスが必要です");
+        return hajimu_null();
+    }
+    const char *guild_id = argv[0].string.data;
+    const char *name = argv[1].string.data;
+    const char *filepath = argv[2].string.data;
+    const char *description = (argc >= 4 && argv[3].type == VALUE_STRING) ?
+                               argv[3].string.data : "";
+    const char *tags = (argc >= 5 && argv[4].type == VALUE_STRING) ?
+                        argv[4].string.data : name;
+
+    /* Build JSON payload for multipart */
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    jb_str(&sb, "name", name);
+    jb_str(&sb, "description", description);
+    jb_str(&sb, "tags", tags);
+    jb_obj_end(&sb);
+
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/guilds/%s/stickers", guild_id);
+    long code = 0;
+    JsonNode *resp = discord_rest_multipart(ep, sb.data, filepath, &code);
+    sb_free(&sb);
+    Value result = hajimu_null();
+    if (resp && (code == 200 || code == 201)) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* スタンプ編集(サーバーID, スタンプID, 設定) — Modify Guild Sticker */
+static Value fn_sticker_edit(int argc, Value *argv) {
+    if (argc < 3 || argv[0].type != VALUE_STRING ||
+        argv[1].type != VALUE_STRING || argv[2].type != VALUE_STRING) {
+        LOG_E("スタンプ編集: サーバーID, スタンプID, 設定(JSON文字列)が必要です");
+        return hajimu_bool(false);
+    }
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/guilds/%s/stickers/%s",
+             argv[0].string.data, argv[1].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("PATCH", ep, argv[2].string.data, &code);
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code == 200);
+}
+
+/* スタンプ削除(サーバーID, スタンプID) — Delete Guild Sticker */
+static Value fn_sticker_delete(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING) {
+        LOG_E("スタンプ削除: サーバーID, スタンプIDが必要です");
+        return hajimu_bool(false);
+    }
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/guilds/%s/stickers/%s",
+             argv[0].string.data, argv[1].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("DELETE", ep, NULL, &code);
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code == 204);
+}
+
+/* --- ウェルカム画面管理 --- */
+
+/* ウェルカム画面取得(サーバーID) — Get Guild Welcome Screen */
+static Value fn_welcome_screen_get(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_null();
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/guilds/%s/welcome-screen", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", ep, NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* ウェルカム画面編集(サーバーID, 設定) — Modify Guild Welcome Screen */
+static Value fn_welcome_screen_edit(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING) {
+        LOG_E("ウェルカム画面編集: サーバーID, 設定(JSON文字列)が必要です");
+        return hajimu_null();
+    }
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/guilds/%s/welcome-screen", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("PATCH", ep, argv[1].string.data, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* --- サーバー編集 --- */
+
+/* サーバー編集(サーバーID, 設定) — Modify Guild */
+static Value fn_guild_edit(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING) {
+        LOG_E("サーバー編集: サーバーID, 設定(JSON文字列)が必要です");
+        return hajimu_null();
+    }
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/guilds/%s", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("PATCH", ep, argv[1].string.data, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* ロール作成(サーバーID, 名前[, 色, 権限]) — Create Guild Role */
+static Value fn_role_create(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING) {
+        LOG_E("ロール作成: サーバーID, 名前が必要です");
+        return hajimu_null();
+    }
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    jb_str(&sb, "name", argv[1].string.data);
+    if (argc >= 3 && argv[2].type == VALUE_NUMBER)
+        jb_int(&sb, "color", (int64_t)argv[2].number);
+    if (argc >= 4 && argv[3].type == VALUE_STRING)
+        jb_raw(&sb, "permissions", argv[3].string.data);
+    jb_obj_end(&sb);
+
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/guilds/%s/roles", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("POST", ep, sb.data, &code);
+    sb_free(&sb);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* ロール編集(サーバーID, ロールID, 設定) — Modify Guild Role */
+static Value fn_role_edit(int argc, Value *argv) {
+    if (argc < 3 || argv[0].type != VALUE_STRING ||
+        argv[1].type != VALUE_STRING || argv[2].type != VALUE_STRING) {
+        LOG_E("ロール編集: サーバーID, ロールID, 設定(JSON)が必要です");
+        return hajimu_null();
+    }
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/guilds/%s/roles/%s",
+             argv[0].string.data, argv[1].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("PATCH", ep, argv[2].string.data, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* ロール削除(サーバーID, ロールID) — Delete Guild Role */
+static Value fn_role_delete(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING) {
+        LOG_E("ロール削除: サーバーID, ロールIDが必要です");
+        return hajimu_bool(false);
+    }
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/guilds/%s/roles/%s",
+             argv[0].string.data, argv[1].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("DELETE", ep, NULL, &code);
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code == 204);
+}
+
+/* --- フォーラムチャンネル --- */
+
+/* フォーラム投稿(チャンネルID, タイトル, 内容[, タグ配列]) — Create Forum Thread */
+static Value fn_forum_post(int argc, Value *argv) {
+    if (argc < 3 || argv[0].type != VALUE_STRING ||
+        argv[1].type != VALUE_STRING || argv[2].type != VALUE_STRING) {
+        LOG_E("フォーラム投稿: チャンネルID, タイトル, 内容が必要です");
+        return hajimu_null();
+    }
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    jb_str(&sb, "name", argv[1].string.data);
+    jb_key(&sb, "message"); jb_obj_start(&sb);
+    jb_str(&sb, "content", argv[2].string.data);
+    jb_obj_end(&sb); sb_append_char(&sb, ',');
+    /* applied_tags */
+    if (argc >= 4 && argv[3].type == VALUE_ARRAY) {
+        jb_key(&sb, "applied_tags"); jb_arr_start(&sb);
+        for (int i = 0; i < argv[3].array.length; i++) {
+            if (argv[3].array.elements[i].type == VALUE_STRING) {
+                json_escape_str(&sb, argv[3].array.elements[i].string.data);
+                sb_append_char(&sb, ',');
+            }
+        }
+        jb_arr_end(&sb); sb_append_char(&sb, ',');
+    }
+    jb_obj_end(&sb);
+
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/channels/%s/threads", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("POST", ep, sb.data, &code);
+    sb_free(&sb);
+    Value result = hajimu_null();
+    if (resp && (code == 200 || code == 201)) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* フォーラムタグ一覧(チャンネルID) — Get Forum Tags (from channel info) */
+static Value fn_forum_tags(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_array();
+    char ep[128];
+    snprintf(ep, sizeof(ep), "/channels/%s", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", ep, NULL, &code);
+    Value result = hajimu_array();
+    if (resp && code == 200) {
+        JsonNode *tags = json_get(resp, "available_tags");
+        if (tags) result = json_to_value(tags);
+    }
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* --- Markdown ユーティリティ --- */
+
+/* 太字(テキスト) */
+static Value fn_md_bold(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_string("");
+    char buf[8192];
+    snprintf(buf, sizeof(buf), "**%s**", argv[0].string.data);
+    return hajimu_string(buf);
+}
+
+/* 斜体(テキスト) */
+static Value fn_md_italic(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_string("");
+    char buf[8192];
+    snprintf(buf, sizeof(buf), "*%s*", argv[0].string.data);
+    return hajimu_string(buf);
+}
+
+/* 下線(テキスト) */
+static Value fn_md_underline(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_string("");
+    char buf[8192];
+    snprintf(buf, sizeof(buf), "__%s__", argv[0].string.data);
+    return hajimu_string(buf);
+}
+
+/* 取り消し線(テキスト) */
+static Value fn_md_strikethrough(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_string("");
+    char buf[8192];
+    snprintf(buf, sizeof(buf), "~~%s~~", argv[0].string.data);
+    return hajimu_string(buf);
+}
+
+/* コード(テキスト) */
+static Value fn_md_code(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_string("");
+    char buf[8192];
+    snprintf(buf, sizeof(buf), "`%s`", argv[0].string.data);
+    return hajimu_string(buf);
+}
+
+/* コードブロック(テキスト[, 言語]) */
+static Value fn_md_codeblock(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_string("");
+    const char *lang = (argc >= 2 && argv[1].type == VALUE_STRING) ?
+                        argv[1].string.data : "";
+    char buf[16384];
+    snprintf(buf, sizeof(buf), "```%s\n%s\n```", lang, argv[0].string.data);
+    return hajimu_string(buf);
+}
+
+/* 引用(テキスト) */
+static Value fn_md_quote(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_string("");
+    char buf[8192];
+    snprintf(buf, sizeof(buf), "> %s", argv[0].string.data);
+    return hajimu_string(buf);
+}
+
+/* スポイラー(テキスト) */
+static Value fn_md_spoiler(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_string("");
+    char buf[8192];
+    snprintf(buf, sizeof(buf), "||%s||", argv[0].string.data);
+    return hajimu_string(buf);
+}
+
+/* ユーザーメンション(ユーザーID) */
+static Value fn_md_mention_user(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_string("");
+    char buf[128];
+    snprintf(buf, sizeof(buf), "<@%s>", argv[0].string.data);
+    return hajimu_string(buf);
+}
+
+/* チャンネルメンション(チャンネルID) */
+static Value fn_md_mention_channel(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_string("");
+    char buf[128];
+    snprintf(buf, sizeof(buf), "<#%s>", argv[0].string.data);
+    return hajimu_string(buf);
+}
+
+/* ロールメンション(ロールID) */
+static Value fn_md_mention_role(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_string("");
+    char buf[128];
+    snprintf(buf, sizeof(buf), "<@&%s>", argv[0].string.data);
+    return hajimu_string(buf);
+}
+
+/* タイムスタンプ(UNIX秒[, スタイル]) — Discord timestamp format
+ * スタイル: "t"=短時間, "T"=長時間, "d"=短日付, "D"=長日付,
+ *           "f"=短日時(デフォルト), "F"=長日時, "R"=相対 */
+static Value fn_md_timestamp(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_NUMBER) return hajimu_string("");
+    int64_t ts = (int64_t)argv[0].number;
+    char buf[128];
+    if (argc >= 2 && argv[1].type == VALUE_STRING && argv[1].string.data[0]) {
+        snprintf(buf, sizeof(buf), "<t:%lld:%s>", (long long)ts, argv[1].string.data);
+    } else {
+        snprintf(buf, sizeof(buf), "<t:%lld>", (long long)ts);
+    }
+    return hajimu_string(buf);
+}
+
+/* カスタム絵文字(名前, ID[, アニメーション]) — <:name:id> or <a:name:id> */
+static Value fn_md_emoji(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING)
+        return hajimu_string("");
+    bool animated = (argc >= 3 && argv[2].type == VALUE_BOOL && argv[2].boolean);
+    char buf[256];
+    snprintf(buf, sizeof(buf), "<%s:%s:%s>",
+             animated ? "a" : "",
+             argv[0].string.data, argv[1].string.data);
+    return hajimu_string(buf);
+}
+
+/* ハイパーリンク(テキスト, URL) — [text](url) — Embed内で使用可能 */
+static Value fn_md_link(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING)
+        return hajimu_string("");
+    char buf[4096];
+    snprintf(buf, sizeof(buf), "[%s](%s)",
+             argv[0].string.data, argv[1].string.data);
+    return hajimu_string(buf);
+}
+
+/* 見出し(テキスト, レベル) — # テキスト (レベル1-3) */
+static Value fn_md_heading(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_NUMBER)
+        return hajimu_string("");
+    int level = (int)argv[1].number;
+    if (level < 1) level = 1;
+    if (level > 3) level = 3;
+    char prefix[4] = {0};
+    for (int i = 0; i < level; i++) prefix[i] = '#';
+    char buf[8192];
+    snprintf(buf, sizeof(buf), "%s %s", prefix, argv[0].string.data);
+    return hajimu_string(buf);
+}
+
+/* リスト(配列[, 番号付き]) — builds a markdown list from array */
+static Value fn_md_list(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_ARRAY) return hajimu_string("");
+    bool numbered = (argc >= 2 && argv[1].type == VALUE_BOOL && argv[1].boolean);
+
+    StrBuf sb; sb_init(&sb);
+    for (int i = 0; i < argv[0].array.length; i++) {
+        if (argv[0].array.elements[i].type == VALUE_STRING) {
+            if (numbered) {
+                sb_appendf(&sb, "%d. %s\n", i + 1, argv[0].array.elements[i].string.data);
+            } else {
+                sb_appendf(&sb, "- %s\n", argv[0].array.elements[i].string.data);
+            }
+        }
+    }
+    Value result = hajimu_string(sb.data ? sb.data : "");
+    sb_free(&sb);
+    return result;
+}
+
+/* =========================================================================
  * Section 15: Plugin Registration
  * ========================================================================= */
 
@@ -6643,6 +7145,51 @@ static HajimuPluginFunc functions[] = {
     {"音声ループ",           fn_voice_loop,        2,  2},
     {"VC状態",               fn_vc_status,         1,  1},
     {"音声音量",             fn_voice_volume,      2,  2},
+
+    /* ステージチャンネル (v2.1.0) */
+    {"ステージ開始",         fn_stage_start,       2,  3},
+    {"ステージ編集",         fn_stage_edit,        2,  2},
+    {"ステージ終了",         fn_stage_end,         1,  1},
+    {"ステージ情報",         fn_stage_info,        1,  1},
+
+    /* スタンプ管理 (v2.1.0) */
+    {"スタンプ一覧",         fn_sticker_list,      1,  1},
+    {"スタンプ取得",         fn_sticker_get,       2,  2},
+    {"スタンプ作成",         fn_sticker_create,    3,  5},
+    {"スタンプ編集",         fn_sticker_edit,      3,  3},
+    {"スタンプ削除",         fn_sticker_delete,    2,  2},
+
+    /* ウェルカム画面 (v2.1.0) */
+    {"ウェルカム画面取得",   fn_welcome_screen_get,  1,  1},
+    {"ウェルカム画面編集",   fn_welcome_screen_edit, 2,  2},
+
+    /* サーバー・ロール管理 (v2.1.0) */
+    {"サーバー編集",         fn_guild_edit,        2,  2},
+    {"ロール作成",           fn_role_create,       2,  4},
+    {"ロール編集",           fn_role_edit,         3,  3},
+    {"ロール削除",           fn_role_delete,       2,  2},
+
+    /* フォーラムチャンネル (v2.1.0) */
+    {"フォーラム投稿",       fn_forum_post,        3,  4},
+    {"フォーラムタグ一覧",   fn_forum_tags,        1,  1},
+
+    /* Markdownユーティリティ (v2.1.0) */
+    {"太字",                 fn_md_bold,           1,  1},
+    {"斜体",                 fn_md_italic,         1,  1},
+    {"下線",                 fn_md_underline,      1,  1},
+    {"取り消し線",           fn_md_strikethrough,  1,  1},
+    {"コード",               fn_md_code,           1,  1},
+    {"コードブロック",       fn_md_codeblock,      1,  2},
+    {"引用",                 fn_md_quote,          1,  1},
+    {"スポイラー",           fn_md_spoiler,        1,  1},
+    {"ユーザーメンション",   fn_md_mention_user,   1,  1},
+    {"チャンネルメンション", fn_md_mention_channel, 1, 1},
+    {"ロールメンション",     fn_md_mention_role,   1,  1},
+    {"タイムスタンプ",       fn_md_timestamp,      1,  2},
+    {"カスタム絵文字",       fn_md_emoji,          2,  3},
+    {"リンク",               fn_md_link,           2,  2},
+    {"見出し",               fn_md_heading,        2,  2},
+    {"リスト",               fn_md_list,           1,  2},
 
     /* サーバー */
     {"サーバー情報",         fn_guild_info,        1,  1},

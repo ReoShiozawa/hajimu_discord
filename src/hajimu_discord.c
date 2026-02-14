@@ -2964,6 +2964,45 @@ static bool voice_filepath_safe(const char *path) {
     return true;
 }
 
+/* Check if source is a YouTube/supported streaming URL */
+static bool is_youtube_url(const char *url) {
+    return (strstr(url, "youtube.com/watch") != NULL ||
+            strstr(url, "youtu.be/") != NULL ||
+            strstr(url, "youtube.com/shorts/") != NULL ||
+            strstr(url, "youtube.com/playlist") != NULL ||
+            strstr(url, "music.youtube.com/") != NULL ||
+            strstr(url, "soundcloud.com/") != NULL ||
+            strstr(url, "nicovideo.jp/") != NULL ||
+            strstr(url, "twitter.com/") != NULL ||
+            strstr(url, "x.com/") != NULL);
+}
+
+/* Run yt-dlp and read output (helper) */
+static char *ytdlp_exec(const char *args, const char *url) {
+    if (!voice_filepath_safe(url)) return NULL;
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd), "yt-dlp %s \"%s\" 2>/dev/null", args, url);
+    FILE *pp = popen(cmd, "r");
+    if (!pp) return NULL;
+
+    char *buf = (char *)calloc(1, 4096);
+    if (!buf) { pclose(pp); return NULL; }
+    size_t total = 0;
+    char line[1024];
+    while (fgets(line, sizeof(line), pp)) {
+        size_t len = strlen(line);
+        if (total + len >= 4095) break;
+        memcpy(buf + total, line, len);
+        total += len;
+    }
+    buf[total] = '\0';
+    pclose(pp);
+    /* Trim trailing newlines */
+    while (total > 0 && (buf[total-1] == '\n' || buf[total-1] == '\r'))
+        buf[--total] = '\0';
+    return buf;
+}
+
 static void *voice_audio_thread_func(void *arg) {
     VoiceConn *vc = (VoiceConn *)arg;
 
@@ -3027,11 +3066,21 @@ static void *voice_audio_thread_func(void *arg) {
                 vc->playing = false;
                 continue;
             }
-            /* Use ffmpeg to convert any audio to 48kHz 16bit stereo PCM */
-            char cmd[1024];
-            snprintf(cmd, sizeof(cmd),
-                "ffmpeg -i \"%s\" -f s16le -ar %d -ac %d -loglevel error -",
-                filepath, VOICE_SAMPLE_RATE, VOICE_CHANNELS);
+
+            char cmd[2048];
+            if (is_youtube_url(filepath)) {
+                /* YouTube/streaming: yt-dlp → ffmpeg pipe */
+                LOG_I("yt-dlp経由で再生: %s", filepath);
+                snprintf(cmd, sizeof(cmd),
+                    "yt-dlp -o - -f bestaudio --no-playlist --no-warnings \"%s\" 2>/dev/null | "
+                    "ffmpeg -i pipe:0 -f s16le -ar %d -ac %d -loglevel error -",
+                    filepath, VOICE_SAMPLE_RATE, VOICE_CHANNELS);
+            } else {
+                /* Local file or direct URL: ffmpeg only */
+                snprintf(cmd, sizeof(cmd),
+                    "ffmpeg -i \"%s\" -f s16le -ar %d -ac %d -loglevel error -",
+                    filepath, VOICE_SAMPLE_RATE, VOICE_CHANNELS);
+            }
             fp = popen(cmd, "r");
             if (!fp) {
                 LOG_E("ffmpeg起動失敗: %s", filepath);
@@ -6625,6 +6674,199 @@ static Value fn_voice_volume(int argc, Value *argv) {
 }
 
 /* =========================================================================
+ * YouTube / yt-dlp 連携
+ * ========================================================================= */
+
+/* YouTube情報(URL) — yt-dlp で動画情報を取得 (タイトル, 再生時間, サムネイル等) */
+static Value fn_ytdlp_info(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) {
+        LOG_E("YouTube情報: URL(文字列)が必要です");
+        return hajimu_null();
+    }
+    const char *url = argv[0].string.data;
+    if (!voice_filepath_safe(url)) {
+        LOG_E("YouTube情報: URLに不正な文字が含まれています");
+        return hajimu_null();
+    }
+
+    /* Get JSON info from yt-dlp */
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd),
+        "yt-dlp --no-playlist --no-warnings -j \"%s\" 2>/dev/null", url);
+    FILE *pp = popen(cmd, "r");
+    if (!pp) {
+        LOG_E("YouTube情報: yt-dlp起動失敗");
+        return hajimu_null();
+    }
+
+    /* Read JSON output (can be large, limit to 32KB) */
+    size_t buf_size = 32768;
+    char *buf = (char *)calloc(1, buf_size);
+    if (!buf) { pclose(pp); return hajimu_null(); }
+    size_t total = 0;
+    char chunk[4096];
+    while (fgets(chunk, sizeof(chunk), pp)) {
+        size_t len = strlen(chunk);
+        if (total + len >= buf_size - 1) break;
+        memcpy(buf + total, chunk, len);
+        total += len;
+    }
+    buf[total] = '\0';
+    pclose(pp);
+
+    if (total == 0) {
+        free(buf);
+        LOG_E("YouTube情報: yt-dlpから出力がありません");
+        return hajimu_null();
+    }
+
+    /* Parse the full JSON */
+    JsonNode *root = json_parse(buf);
+    free(buf);
+    if (!root) {
+        LOG_E("YouTube情報: JSON解析失敗");
+        return hajimu_null();
+    }
+
+    /* Extract key fields into a compact dict */
+    const char *title    = json_get_str(root, "title");
+    const char *uploader = json_get_str(root, "uploader");
+    const char *thumb    = json_get_str(root, "thumbnail");
+    const char *webpage  = json_get_str(root, "webpage_url");
+    const char *vid_id   = json_get_str(root, "id");
+    double duration      = json_get_num(root, "duration");
+    double view_count    = json_get_num(root, "view_count");
+    double like_count    = json_get_num(root, "like_count");
+    bool is_live         = false;
+    JsonNode *live_node  = json_get(root, "is_live");
+    if (live_node && live_node->type == JSON_BOOL) is_live = live_node->boolean;
+
+    /* Build result dict */
+    Value dict;
+    memset(&dict, 0, sizeof(dict));
+    dict.type = VALUE_DICT;
+    int n = 10;
+    dict.dict.keys     = (char **)calloc((size_t)n, sizeof(char *));
+    dict.dict.values   = (Value *)calloc((size_t)n, sizeof(Value));
+    dict.dict.length   = 0;
+    dict.dict.capacity = n;
+
+    #define YT_SET_STR(k, v) do { \
+        dict.dict.keys[dict.dict.length] = strdup(k); \
+        dict.dict.values[dict.dict.length] = hajimu_string((v) ? (v) : ""); \
+        dict.dict.length++; \
+    } while(0)
+    #define YT_SET_NUM(k, v) do { \
+        dict.dict.keys[dict.dict.length] = strdup(k); \
+        dict.dict.values[dict.dict.length] = hajimu_number(v); \
+        dict.dict.length++; \
+    } while(0)
+    #define YT_SET_BOOL(k, v) do { \
+        dict.dict.keys[dict.dict.length] = strdup(k); \
+        dict.dict.values[dict.dict.length] = hajimu_bool(v); \
+        dict.dict.length++; \
+    } while(0)
+
+    YT_SET_STR("タイトル", title);
+    YT_SET_STR("投稿者", uploader);
+    YT_SET_NUM("再生時間", duration);
+    YT_SET_STR("サムネイル", thumb);
+    YT_SET_STR("URL", webpage);
+    YT_SET_STR("ID", vid_id);
+    YT_SET_NUM("再生回数", view_count);
+    YT_SET_NUM("高評価数", like_count);
+    YT_SET_BOOL("ライブ", is_live);
+
+    /* Duration formatted string */
+    int dur_min = (int)duration / 60;
+    int dur_sec = (int)duration % 60;
+    char dur_str[32];
+    snprintf(dur_str, sizeof(dur_str), "%d:%02d", dur_min, dur_sec);
+    YT_SET_STR("再生時間表示", dur_str);
+
+    #undef YT_SET_STR
+    #undef YT_SET_NUM
+    #undef YT_SET_BOOL
+
+    json_free(root);
+    free(root);
+    return dict;
+}
+
+/* YouTube検索(クエリ[, 件数]) — yt-dlp で検索して結果を返す */
+static Value fn_ytdlp_search(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) {
+        LOG_E("YouTube検索: クエリ(文字列)が必要です");
+        return hajimu_null();
+    }
+    const char *query = argv[0].string.data;
+    int count = 1;
+    if (argc >= 2 && argv[1].type == VALUE_NUMBER)
+        count = (int)argv[1].number;
+    if (count < 1) count = 1;
+    if (count > 10) count = 10;
+
+    if (!voice_filepath_safe(query)) {
+        LOG_E("YouTube検索: クエリに不正な文字が含まれています");
+        return hajimu_null();
+    }
+
+    /* yt-dlp ytsearch: returns JSON for each result */
+    char cmd[2048];
+    snprintf(cmd, sizeof(cmd),
+        "yt-dlp --no-playlist --no-warnings --flat-playlist "
+        "--print \"{\\\"タイトル\\\": \\\"%%(title)s\\\", \\\"URL\\\": \\\"https://www.youtube.com/watch?v=%%(id)s\\\", \\\"ID\\\": \\\"%%(id)s\\\", \\\"投稿者\\\": \\\"%%(uploader)s\\\", \\\"再生時間\\\": %%(duration)s}\" "
+        "\"ytsearch%d:%s\" 2>/dev/null",
+        count, query);
+    FILE *pp = popen(cmd, "r");
+    if (!pp) {
+        LOG_E("YouTube検索: yt-dlp起動失敗");
+        return hajimu_null();
+    }
+
+    Value arr = hajimu_array();
+    char line[2048];
+    while (fgets(line, sizeof(line), pp)) {
+        /* Trim newline */
+        size_t len = strlen(line);
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r'))
+            line[--len] = '\0';
+        if (len == 0) continue;
+
+        JsonNode *node = json_parse(line);
+        if (node) {
+            Value val = json_to_value(node);
+            hajimu_array_push(&arr, val);
+            json_free(node);
+            free(node);
+        }
+    }
+    pclose(pp);
+
+    /* If only 1 result requested, return the single item directly */
+    if (count == 1 && arr.type == VALUE_ARRAY && arr.array.length > 0) {
+        return arr.array.elements[0];
+    }
+    return arr;
+}
+
+/* YouTubeタイトル(URL) — URLからタイトルだけ取得 (軽量) */
+static Value fn_ytdlp_title(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) {
+        LOG_E("YouTubeタイトル: URL(文字列)が必要です");
+        return hajimu_null();
+    }
+    char *result = ytdlp_exec("--no-playlist --no-warnings --print title", argv[0].string.data);
+    if (!result || !result[0]) {
+        free(result);
+        return hajimu_null();
+    }
+    Value val = hajimu_string(result);
+    free(result);
+    return val;
+}
+
+/* =========================================================================
  * v2.1.0: ステージチャンネル・スタンプ・サーバー編集・フォーラム・Markdown
  * ========================================================================= */
 
@@ -8959,6 +9201,11 @@ static HajimuPluginFunc functions[] = {
     {"音声ループ",           fn_voice_loop,        2,  2},
     {"VC状態",               fn_vc_status,         1,  1},
     {"音声音量",             fn_voice_volume,      2,  2},
+
+    /* YouTube / yt-dlp (v2.4.0) */
+    {"YouTube情報",          fn_ytdlp_info,        1,  1},
+    {"YouTube検索",          fn_ytdlp_search,      1,  2},
+    {"YouTubeタイトル",      fn_ytdlp_title,       1,  1},
 
     /* ステージチャンネル (v2.1.0) */
     {"ステージ開始",         fn_stage_start,       2,  3},

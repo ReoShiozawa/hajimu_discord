@@ -1829,7 +1829,18 @@ static void gw_handle_ready(JsonNode *data) {
     JsonNode *app = json_get(data, "application");
     if (app) {
         const char *app_id = json_get_str(app, "id");
-        if (app_id) snprintf(g_bot.application_id, sizeof(g_bot.application_id), "%s", app_id);
+        if (app_id) {
+            if (g_bot.application_id[0]) {
+                /* 環境変数で既に設定済み — 一致確認のみ */
+                if (strcmp(g_bot.application_id, app_id) != 0) {
+                    LOG_W("CLIENT_ID 不一致: env=%s, READY=%s (READYの値を使用)",
+                          g_bot.application_id, app_id);
+                    snprintf(g_bot.application_id, sizeof(g_bot.application_id), "%s", app_id);
+                }
+            } else {
+                snprintf(g_bot.application_id, sizeof(g_bot.application_id), "%s", app_id);
+            }
+        }
     }
 
     g_bot.gateway_ready = true;
@@ -3251,6 +3262,14 @@ static Value fn_bot_create(int argc, Value *argv) {
 
     /* Init libcurl */
     curl_global_init(CURL_GLOBAL_DEFAULT);
+
+    /* CLIENT_ID が環境変数に設定されていれば application_id を先行設定 */
+    const char *client_id_env = getenv("CLIENT_ID");
+    if (!client_id_env) client_id_env = getenv("DISCORD_CLIENT_ID");
+    if (client_id_env && client_id_env[0]) {
+        snprintf(g_bot.application_id, sizeof(g_bot.application_id), "%s", client_id_env);
+        LOG_I("CLIENT_ID を環境変数から設定: %s", g_bot.application_id);
+    }
 
     LOG_I("ボット初期化完了");
     return hajimu_bool(true);

@@ -17,6 +17,8 @@
  * v1.5.0 — 2026-02-14  Webhook・ファイル添付
  * v1.6.0 — 2026-02-14  コレクター・メンバーキャッシュ・サーバー一覧
  * v1.7.0 — 2026-02-14  監査ログ・AutoModeration・絵文字・スケジュールイベント・投票
+ * v1.7.1 — 2026-02-14  セキュリティ修正・バグ修正
+ * v2.0.0 — 2026-02-14  ボイスチャンネル対応 (Opus/Sodium)
  */
 
 #define _GNU_SOURCE
@@ -49,12 +51,16 @@
 #include <openssl/evp.h>
 #include <zlib.h>
 
+/* v2.0.0: Voice — Opus encoding + Sodium encryption */
+#include <opus.h>
+#include <sodium.h>
+
 /* =========================================================================
  * Section 1: Constants & Macros
  * ========================================================================= */
 
 #define PLUGIN_NAME    "hajimu_discord"
-#define PLUGIN_VERSION "1.7.1"
+#define PLUGIN_VERSION "2.0.0"
 
 /* Discord API */
 #define DISCORD_API_BASE    "https://discord.com/api/v10"
@@ -94,6 +100,16 @@
 /* v1.6.0: Collector limits */
 #define MAX_COLLECTORS        16
 #define MAX_COLLECTED         100
+
+/* v2.0.0: Voice limits */
+#define MAX_VOICE_CONNS       8     /* Max simultaneous voice connections */
+#define VOICE_SAMPLE_RATE     48000
+#define VOICE_CHANNELS        2     /* Stereo */
+#define VOICE_FRAME_MS        20
+#define VOICE_FRAME_SAMPLES   (VOICE_SAMPLE_RATE * VOICE_FRAME_MS / 1000) /* 960 */
+#define VOICE_FRAME_SIZE      (VOICE_FRAME_SAMPLES * VOICE_CHANNELS)       /* 1920 */
+#define VOICE_MAX_PACKET      4000
+#define MAX_AUDIO_QUEUE       64
 
 /* Discord component types */
 #define COMP_ACTION_ROW       1
@@ -324,6 +340,63 @@ typedef struct {
     uint8_t   zbuf[ZLIB_CHUNK];
 } WsConn;
 
+/* --- v2.0.0: Voice Connection --- */
+typedef struct {
+    char path[256];       /* File/URL path */
+} AudioQueueItem;
+
+typedef struct {
+    /* Identity */
+    char guild_id[MAX_SNOWFLAKE];
+    char channel_id[MAX_SNOWFLAKE];
+    char session_id[128];
+    char voice_token[128];
+    char endpoint[256];
+    bool active;
+
+    /* Voice WebSocket */
+    WsConn vws;
+    uint32_t ssrc;
+    char voice_ip[64];
+    int  voice_port;
+    unsigned char secret_key[32];
+    bool ready;
+
+    /* UDP */
+    int udp_fd;
+    struct sockaddr_in udp_addr;
+    char external_ip[64];
+    uint16_t external_port;
+
+    /* Audio state */
+    OpusEncoder *opus_enc;
+    uint16_t rtp_seq;
+    uint32_t rtp_timestamp;
+    bool playing;
+    bool paused;
+    volatile bool stop_requested;
+
+    /* Audio queue */
+    AudioQueueItem queue[MAX_AUDIO_QUEUE];
+    int queue_head;
+    int queue_tail;
+    int queue_count;
+    bool loop_mode;
+
+    /* Threads */
+    pthread_t voice_ws_thread;
+    pthread_t audio_thread;
+    pthread_mutex_t voice_mutex;
+    int voice_heartbeat_interval; /* ms */
+    volatile bool voice_heartbeat_acked;
+
+    /* Pending state (waiting for gateway events) */
+    bool waiting_for_state;
+    bool waiting_for_server;
+    bool state_received;
+    bool server_received;
+} VoiceConn;
+
 /* --- Bot State --- */
 typedef struct {
     /* Authentication */
@@ -395,6 +468,10 @@ typedef struct {
 
     /* Log level */
     int log_level;
+
+    /* Voice connections (v2.0.0) */
+    VoiceConn voice_conns[MAX_VOICE_CONNS];
+    int voice_conn_count;
 } BotState;
 
 static BotState g_bot = {0};
@@ -408,6 +485,15 @@ static void event_fire(const char *name, int argc, Value *argv);
 /* Forward declaration for collector feeding (v1.6.0) */
 static void collector_feed(int type, const char *channel_id,
                            const char *message_id, Value *val);
+
+/* Forward declarations for voice (v2.0.0) */
+static VoiceConn *voice_find(const char *guild_id);
+static VoiceConn *voice_alloc(const char *guild_id);
+static void voice_free(VoiceConn *vc);
+static int voice_ws_connect_raw(WsConn *ws, const char *host, int port, const char *path);
+static void voice_check_ready(VoiceConn *vc);
+static void *voice_ws_thread_func(void *arg);
+static void *voice_audio_thread_func(void *arg);
 
 /* =========================================================================
  * Section 3: Logging
@@ -1914,6 +2000,41 @@ static void gw_handle_dispatch(const char *event_name, JsonNode *data) {
         event_fire("プレゼンス更新", 1, &val);
     } else if (strcmp(event_name, "VOICE_STATE_UPDATE") == 0) {
         event_fire("ボイス状態更新", 1, &val);
+        /* v2.0.0: Capture session_id for our voice connections */
+        {
+            const char *uid = json_get_str(data, "user_id");
+            const char *gid = json_get_str(data, "guild_id");
+            const char *sid = json_get_str(data, "session_id");
+            if (uid && gid && sid && strcmp(uid, g_bot.bot_id) == 0) {
+                VoiceConn *vc = voice_find(gid);
+                if (vc && vc->waiting_for_state) {
+                    snprintf(vc->session_id, sizeof(vc->session_id), "%s", sid);
+                    vc->state_received = true;
+                    vc->waiting_for_state = false;
+                    LOG_I("Voice session_id取得: %.32s", sid);
+                    voice_check_ready(vc);
+                }
+            }
+        }
+    } else if (strcmp(event_name, "VOICE_SERVER_UPDATE") == 0) {
+        event_fire("ボイスサーバー更新", 1, &val);
+        /* v2.0.0: Capture voice server info */
+        {
+            const char *gid = json_get_str(data, "guild_id");
+            const char *token = json_get_str(data, "token");
+            const char *endpoint = json_get_str(data, "endpoint");
+            if (gid && token && endpoint) {
+                VoiceConn *vc = voice_find(gid);
+                if (vc && vc->waiting_for_server) {
+                    snprintf(vc->voice_token, sizeof(vc->voice_token), "%s", token);
+                    snprintf(vc->endpoint, sizeof(vc->endpoint), "%s", endpoint);
+                    vc->server_received = true;
+                    vc->waiting_for_server = false;
+                    LOG_I("Voiceサーバー情報取得: %s", endpoint);
+                    voice_check_ready(vc);
+                }
+            }
+        }
     } else if (strcmp(event_name, "AUTO_MODERATION_ACTION_EXECUTION") == 0) {
         event_fire("自動モデレーション実行", 1, &val);
     } else if (strcmp(event_name, "GUILD_SCHEDULED_EVENT_CREATE") == 0) {
@@ -2180,6 +2301,802 @@ static void *gateway_thread_func(void *arg) {
     ws_close(&g_bot.ws);
     LOG_I("Gatewayスレッド終了");
     return NULL;
+}
+
+/* =========================================================================
+ * Section 13.5: Voice Channel System (v2.0.0)
+ * ========================================================================= */
+
+/* --- Voice Connection Management --- */
+
+static VoiceConn *voice_find(const char *guild_id) {
+    if (!guild_id) return NULL;
+    for (int i = 0; i < g_bot.voice_conn_count; i++) {
+        if (g_bot.voice_conns[i].active &&
+            strcmp(g_bot.voice_conns[i].guild_id, guild_id) == 0)
+            return &g_bot.voice_conns[i];
+    }
+    return NULL;
+}
+
+static VoiceConn *voice_alloc(const char *guild_id) {
+    if (!guild_id) return NULL;
+    /* Check existing */
+    VoiceConn *vc = voice_find(guild_id);
+    if (vc) return vc;
+    /* Find free slot */
+    if (g_bot.voice_conn_count >= MAX_VOICE_CONNS) {
+        LOG_E("ボイス接続上限(%d)に達しました", MAX_VOICE_CONNS);
+        return NULL;
+    }
+    vc = &g_bot.voice_conns[g_bot.voice_conn_count++];
+    memset(vc, 0, sizeof(*vc));
+    snprintf(vc->guild_id, sizeof(vc->guild_id), "%s", guild_id);
+    vc->active = true;
+    vc->vws.fd = -1;
+    vc->udp_fd = -1;
+    pthread_mutex_init(&vc->voice_mutex, NULL);
+    return vc;
+}
+
+static void voice_free(VoiceConn *vc) {
+    if (!vc || !vc->active) return;
+
+    vc->stop_requested = true;
+    vc->playing = false;
+
+    /* Close voice WebSocket */
+    if (vc->vws.connected) {
+        ws_close(&vc->vws);
+    }
+
+    /* Close UDP socket */
+    if (vc->udp_fd >= 0) {
+        close(vc->udp_fd);
+        vc->udp_fd = -1;
+    }
+
+    /* Destroy Opus encoder */
+    if (vc->opus_enc) {
+        opus_encoder_destroy(vc->opus_enc);
+        vc->opus_enc = NULL;
+    }
+
+    /* Wait for threads */
+    if (vc->voice_ws_thread) {
+        pthread_join(vc->voice_ws_thread, NULL);
+        vc->voice_ws_thread = 0;
+    }
+    if (vc->audio_thread) {
+        pthread_join(vc->audio_thread, NULL);
+        vc->audio_thread = 0;
+    }
+
+    pthread_mutex_destroy(&vc->voice_mutex);
+    vc->active = false;
+
+    /* Compact array */
+    int idx = (int)(vc - g_bot.voice_conns);
+    if (idx < g_bot.voice_conn_count - 1) {
+        memmove(&g_bot.voice_conns[idx], &g_bot.voice_conns[idx + 1],
+                (size_t)(g_bot.voice_conn_count - 1 - idx) * sizeof(VoiceConn));
+    }
+    g_bot.voice_conn_count--;
+}
+
+/* --- Voice WebSocket (separate from main Gateway) --- */
+
+/* Connect to voice WebSocket (no zlib decompression needed) */
+static int voice_ws_connect_raw(WsConn *ws, const char *host, int port, const char *path) {
+    struct addrinfo hints = {0}, *res = NULL;
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    char port_str[8];
+    snprintf(port_str, sizeof(port_str), "%d", port);
+
+    if (getaddrinfo(host, port_str, &hints, &res) != 0) {
+        LOG_E("Voice DNS解決失敗: %s", host);
+        return -1;
+    }
+
+    ws->fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (ws->fd < 0) {
+        freeaddrinfo(res);
+        return -1;
+    }
+
+    struct timeval tv = {.tv_sec = 10, .tv_usec = 0};
+    setsockopt(ws->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(ws->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+
+    if (connect(ws->fd, res->ai_addr, res->ai_addrlen) < 0) {
+        freeaddrinfo(res);
+        close(ws->fd); ws->fd = -1;
+        return -1;
+    }
+    freeaddrinfo(res);
+
+    ws->ssl_ctx = SSL_CTX_new(TLS_client_method());
+    if (!ws->ssl_ctx) { close(ws->fd); ws->fd = -1; return -1; }
+    SSL_CTX_set_verify(ws->ssl_ctx, SSL_VERIFY_PEER, NULL);
+    SSL_CTX_set_default_verify_paths(ws->ssl_ctx);
+
+    ws->ssl = SSL_new(ws->ssl_ctx);
+    SSL_set_fd(ws->ssl, ws->fd);
+    SSL_set_tlsext_host_name(ws->ssl, host);
+
+    if (SSL_connect(ws->ssl) <= 0) {
+        SSL_free(ws->ssl); ws->ssl = NULL;
+        SSL_CTX_free(ws->ssl_ctx); ws->ssl_ctx = NULL;
+        close(ws->fd); ws->fd = -1;
+        return -1;
+    }
+
+    /* WebSocket upgrade handshake */
+    uint8_t nonce[16];
+    RAND_bytes(nonce, 16);
+    char *ws_key = base64_encode(nonce, 16);
+
+    char req[2048];
+    int req_len = snprintf(req, sizeof(req),
+        "GET %s HTTP/1.1\r\n"
+        "Host: %s\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        "Sec-WebSocket-Key: %s\r\n"
+        "Sec-WebSocket-Version: 13\r\n"
+        "\r\n",
+        path, host, ws_key);
+    free(ws_key);
+
+    if (SSL_write(ws->ssl, req, req_len) <= 0) goto vws_fail;
+
+    char resp[4096];
+    int rlen = SSL_read(ws->ssl, resp, sizeof(resp) - 1);
+    if (rlen <= 0) goto vws_fail;
+    resp[rlen] = '\0';
+    if (!strstr(resp, "101")) goto vws_fail;
+
+    /* Voice WS does NOT use zlib */
+    ws->zlib_init = false;
+    ws->connected = true;
+    LOG_I("Voice WebSocket接続成功: %s", host);
+    return 0;
+
+vws_fail:
+    if (ws->ssl) { SSL_free(ws->ssl); ws->ssl = NULL; }
+    if (ws->ssl_ctx) { SSL_CTX_free(ws->ssl_ctx); ws->ssl_ctx = NULL; }
+    close(ws->fd); ws->fd = -1;
+    return -1;
+}
+
+/* Read voice WS message (no zlib, plain text frames only) */
+static char *voice_ws_read(WsConn *ws) {
+    if (!ws->connected || !ws->ssl) return NULL;
+
+    StrBuf raw; sb_init(&raw);
+    bool final = false;
+    int msg_opcode = 0;
+
+    while (!final) {
+        uint8_t hdr[2];
+        int r = SSL_read(ws->ssl, hdr, 2);
+        if (r <= 0) { sb_free(&raw); return NULL; }
+
+        final = (hdr[0] & 0x80) != 0;
+        int opcode = hdr[0] & 0x0F;
+        if (opcode != 0) msg_opcode = opcode;
+        bool masked = (hdr[1] & 0x80) != 0;
+        uint64_t payload_len = hdr[1] & 0x7F;
+
+        if (payload_len == 126) {
+            uint8_t ext[2];
+            if (SSL_read(ws->ssl, ext, 2) < 2) { sb_free(&raw); return NULL; }
+            payload_len = ((uint64_t)ext[0] << 8) | ext[1];
+        } else if (payload_len == 127) {
+            uint8_t ext[8];
+            if (SSL_read(ws->ssl, ext, 8) < 8) { sb_free(&raw); return NULL; }
+            payload_len = 0;
+            for (int i = 0; i < 8; i++) payload_len = (payload_len << 8) | ext[i];
+        }
+
+        uint8_t mask_key[4] = {0};
+        if (masked) {
+            if (SSL_read(ws->ssl, mask_key, 4) < 4) { sb_free(&raw); return NULL; }
+        }
+
+        if (payload_len > 0) {
+            if (payload_len > 16 * 1024 * 1024) { sb_free(&raw); return NULL; }
+            uint8_t *buf = (uint8_t *)malloc((size_t)payload_len);
+            if (!buf) { sb_free(&raw); return NULL; }
+            uint64_t total = 0;
+            while (total < payload_len) {
+                int chunk = (int)(payload_len - total);
+                if (chunk > 4096) chunk = 4096;
+                r = SSL_read(ws->ssl, buf + total, chunk);
+                if (r <= 0) { free(buf); sb_free(&raw); return NULL; }
+                total += r;
+            }
+            if (masked) {
+                for (uint64_t i = 0; i < payload_len; i++)
+                    buf[i] ^= mask_key[i & 3];
+            }
+            sb_appendn(&raw, (char *)buf, (int)payload_len);
+            free(buf);
+        }
+
+        if (msg_opcode == WS_OP_PING) {
+            ws_send_pong(ws, (uint8_t *)raw.data, raw.len);
+            sb_free(&raw); sb_init(&raw);
+            final = false;
+            continue;
+        }
+        if (msg_opcode == WS_OP_CLOSE) {
+            sb_free(&raw);
+            return NULL;
+        }
+    }
+
+    sb_append_char(&raw, '\0');
+    return sb_detach(&raw);
+}
+
+/* Send voice identify (op 0) */
+static void voice_send_identify(VoiceConn *vc) {
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    jb_int(&sb, "op", 0);
+    jb_key(&sb, "d"); jb_obj_start(&sb);
+    jb_str(&sb, "server_id", vc->guild_id);
+    jb_str(&sb, "user_id", g_bot.bot_id);
+    jb_str(&sb, "session_id", vc->session_id);
+    jb_str(&sb, "token", vc->voice_token);
+    jb_obj_end(&sb); sb_append_char(&sb, ',');
+    jb_obj_end(&sb);
+    ws_send_text(&vc->vws, sb.data, sb.len);
+    sb_free(&sb);
+    LOG_I("Voice IDENTIFY送信 (guild=%s)", vc->guild_id);
+}
+
+/* Send voice select protocol (op 1) */
+static void voice_send_select_protocol(VoiceConn *vc) {
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    jb_int(&sb, "op", 1);
+    jb_key(&sb, "d"); jb_obj_start(&sb);
+    jb_str(&sb, "protocol", "udp");
+    jb_key(&sb, "data"); jb_obj_start(&sb);
+    jb_str(&sb, "address", vc->external_ip);
+    jb_int(&sb, "port", vc->external_port);
+    jb_str(&sb, "mode", "xsalsa20_poly1305");
+    jb_obj_end(&sb); sb_append_char(&sb, ',');
+    jb_obj_end(&sb); sb_append_char(&sb, ',');
+    jb_obj_end(&sb);
+    ws_send_text(&vc->vws, sb.data, sb.len);
+    sb_free(&sb);
+    LOG_I("Voice SELECT_PROTOCOL送信 (ip=%s, port=%d)", vc->external_ip, vc->external_port);
+}
+
+/* Send voice heartbeat (op 3) */
+static void voice_send_heartbeat(VoiceConn *vc) {
+    /* Voice heartbeat uses a nonce (timestamp) */
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t nonce = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+
+    char buf[64];
+    snprintf(buf, sizeof(buf), "{\"op\":3,\"d\":%llu}", (unsigned long long)nonce);
+    ws_send_text(&vc->vws, buf, (int)strlen(buf));
+    vc->voice_heartbeat_acked = false;
+}
+
+/* Send voice speaking (op 5) */
+static void voice_send_speaking(VoiceConn *vc, bool speaking) {
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    jb_int(&sb, "op", 5);
+    jb_key(&sb, "d"); jb_obj_start(&sb);
+    jb_int(&sb, "speaking", speaking ? 1 : 0);
+    jb_int(&sb, "delay", 0);
+    jb_int(&sb, "ssrc", (int64_t)vc->ssrc);
+    jb_obj_end(&sb); sb_append_char(&sb, ',');
+    jb_obj_end(&sb);
+    ws_send_text(&vc->vws, sb.data, sb.len);
+    sb_free(&sb);
+}
+
+/* --- UDP IP Discovery --- */
+
+static int voice_ip_discovery(VoiceConn *vc) {
+    /* Create UDP socket */
+    vc->udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (vc->udp_fd < 0) {
+        LOG_E("Voice UDPソケット作成失敗");
+        return -1;
+    }
+
+    memset(&vc->udp_addr, 0, sizeof(vc->udp_addr));
+    vc->udp_addr.sin_family = AF_INET;
+    vc->udp_addr.sin_port = htons((uint16_t)vc->voice_port);
+    inet_pton(AF_INET, vc->voice_ip, &vc->udp_addr.sin_addr);
+
+    /* Set timeout */
+    struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
+    setsockopt(vc->udp_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    /* Send 74-byte IP Discovery packet:
+     * Type (2) = 0x0001, Length (2) = 70, SSRC (4), Address (64), Port (2) */
+    uint8_t disc_pkt[74];
+    memset(disc_pkt, 0, sizeof(disc_pkt));
+    disc_pkt[0] = 0x00; disc_pkt[1] = 0x01; /* Type: Request */
+    disc_pkt[2] = 0x00; disc_pkt[3] = 70;   /* Length: 70 */
+    disc_pkt[4] = (vc->ssrc >> 24) & 0xFF;
+    disc_pkt[5] = (vc->ssrc >> 16) & 0xFF;
+    disc_pkt[6] = (vc->ssrc >> 8) & 0xFF;
+    disc_pkt[7] = vc->ssrc & 0xFF;
+
+    ssize_t sent = sendto(vc->udp_fd, disc_pkt, sizeof(disc_pkt), 0,
+                          (struct sockaddr *)&vc->udp_addr, sizeof(vc->udp_addr));
+    if (sent != sizeof(disc_pkt)) {
+        LOG_E("Voice IP Discovery送信失敗");
+        return -1;
+    }
+
+    /* Receive response: same 74-byte format with our external IP+port filled in */
+    uint8_t resp[74];
+    socklen_t addr_len = sizeof(vc->udp_addr);
+    ssize_t rcvd = recvfrom(vc->udp_fd, resp, sizeof(resp), 0,
+                            (struct sockaddr *)&vc->udp_addr, &addr_len);
+    if (rcvd < 74) {
+        LOG_E("Voice IP Discovery応答不正 (%zd bytes)", rcvd);
+        return -1;
+    }
+
+    /* Extract IP (bytes 8-71) and port (bytes 72-73, big-endian) */
+    snprintf(vc->external_ip, sizeof(vc->external_ip), "%s", (char *)&resp[8]);
+    vc->external_port = ((uint16_t)resp[72] << 8) | resp[73];
+
+    LOG_I("Voice IP Discovery完了: %s:%d", vc->external_ip, vc->external_port);
+    return 0;
+}
+
+/* --- Voice WebSocket Thread --- */
+
+static void *voice_ws_thread_func(void *arg) {
+    VoiceConn *vc = (VoiceConn *)arg;
+
+    /* Parse endpoint: remove port suffix, strip wss:// if present */
+    char host[256] = {0};
+    snprintf(host, sizeof(host), "%s", vc->endpoint);
+
+    /* Remove :80 or trailing port */
+    char *colon = strrchr(host, ':');
+    if (colon) *colon = '\0';
+
+    /* Build path */
+    char path[512];
+    snprintf(path, sizeof(path), "/?v=4");
+
+    LOG_I("Voice WebSocketに接続中... (%s)", host);
+    if (voice_ws_connect_raw(&vc->vws, host, 443, path) < 0) {
+        LOG_E("Voice WebSocket接続失敗");
+        return NULL;
+    }
+
+    /* Send IDENTIFY */
+    voice_send_identify(vc);
+
+    /* Read messages */
+    time_t last_heartbeat = time(NULL);
+
+    while (vc->active && vc->vws.connected && !g_shutdown) {
+        /* Set short read timeout for heartbeating */
+        struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
+        setsockopt(vc->vws.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        char *msg = voice_ws_read(&vc->vws);
+        if (!msg) {
+            /* Check if it's just a timeout */
+            if (vc->active && vc->vws.connected && !g_shutdown) {
+                /* Send heartbeat if interval elapsed */
+                if (vc->voice_heartbeat_interval > 0) {
+                    time_t now = time(NULL);
+                    if ((now - last_heartbeat) * 1000 >= vc->voice_heartbeat_interval) {
+                        voice_send_heartbeat(vc);
+                        last_heartbeat = now;
+                    }
+                }
+                continue;
+            }
+            break;
+        }
+
+        JsonNode *root = json_parse(msg);
+        if (!root) { free(msg); continue; }
+
+        int op = (int)json_get_num(root, "op");
+        JsonNode *d = json_get(root, "d");
+
+        switch (op) {
+        case 8: { /* HELLO — get heartbeat_interval */
+            if (d) {
+                double hb = json_get_num(d, "heartbeat_interval");
+                vc->voice_heartbeat_interval = (int)hb;
+                LOG_I("Voice Heartbeat間隔: %dms", vc->voice_heartbeat_interval);
+                /* Send first heartbeat immediately */
+                voice_send_heartbeat(vc);
+                last_heartbeat = time(NULL);
+            }
+            break;
+        }
+        case 2: { /* READY — get SSRC, IP, port */
+            if (d) {
+                vc->ssrc = (uint32_t)json_get_num(d, "ssrc");
+                const char *ip = json_get_str(d, "ip");
+                int port = (int)json_get_num(d, "port");
+                if (ip) snprintf(vc->voice_ip, sizeof(vc->voice_ip), "%s", ip);
+                vc->voice_port = port;
+                LOG_I("Voice READY: ssrc=%u, ip=%s, port=%d", vc->ssrc, vc->voice_ip, vc->voice_port);
+
+                /* Perform IP Discovery */
+                if (voice_ip_discovery(vc) == 0) {
+                    /* Send SELECT_PROTOCOL */
+                    voice_send_select_protocol(vc);
+                } else {
+                    LOG_E("Voice IP Discovery失敗");
+                }
+            }
+            break;
+        }
+        case 4: { /* SESSION_DESCRIPTION — get secret_key */
+            if (d) {
+                JsonNode *key_arr = json_get(d, "secret_key");
+                if (key_arr && key_arr->type == JSON_ARRAY) {
+                    int ki = 0;
+                    int kcount = key_arr->arr.count;
+                    if (kcount > 32) kcount = 32;
+                    for (ki = 0; ki < kcount; ki++) {
+                        vc->secret_key[ki] = (unsigned char)(int)key_arr->arr.items[ki].number;
+                    }
+                    vc->ready = true;
+                    LOG_I("Voice準備完了! (guild=%s)", vc->guild_id);
+
+                    /* Initialize Opus encoder */
+                    int err;
+                    vc->opus_enc = opus_encoder_create(VOICE_SAMPLE_RATE, VOICE_CHANNELS,
+                                                       OPUS_APPLICATION_AUDIO, &err);
+                    if (err != OPUS_OK || !vc->opus_enc) {
+                        LOG_E("Opusエンコーダー作成失敗: %s", opus_strerror(err));
+                        vc->ready = false;
+                    } else {
+                        opus_encoder_ctl(vc->opus_enc, OPUS_SET_BITRATE(64000));
+                        LOG_I("Opusエンコーダー初期化完了");
+                    }
+
+                    /* Fire voice ready event */
+                    Value guild_val = hajimu_string(vc->guild_id);
+                    event_fire("ボイス接続完了", 1, &guild_val);
+                    event_fire("VOICE_CONNECTED", 1, &guild_val);
+                }
+            }
+            break;
+        }
+        case 6: { /* HEARTBEAT_ACK */
+            vc->voice_heartbeat_acked = true;
+            break;
+        }
+        default:
+            LOG_D("Voice WS未処理op: %d", op);
+            break;
+        }
+
+        json_free(root);
+        free(msg);
+
+        /* Send heartbeat if needed */
+        if (vc->voice_heartbeat_interval > 0) {
+            time_t now = time(NULL);
+            if ((now - last_heartbeat) * 1000 >= vc->voice_heartbeat_interval) {
+                voice_send_heartbeat(vc);
+                last_heartbeat = now;
+            }
+        }
+    }
+
+    LOG_I("Voice WebSocketスレッド終了 (guild=%s)", vc->guild_id);
+    return NULL;
+}
+
+/* --- Kick off voice WS after both gateway events received --- */
+
+static void voice_check_ready(VoiceConn *vc) {
+    if (!vc->state_received || !vc->server_received) return;
+
+    LOG_I("Voice両イベント受信完了。Voice WSに接続開始...");
+    /* Start voice WebSocket thread */
+    pthread_create(&vc->voice_ws_thread, NULL, voice_ws_thread_func, vc);
+    pthread_detach(vc->voice_ws_thread);
+}
+
+/* --- Audio Playback Thread --- */
+
+/* Read WAV file header, return number of channels and sample rate */
+static bool wav_read_header(FILE *fp, int *channels, int *sample_rate, int *bits_per_sample) {
+    uint8_t hdr[44];
+    if (fread(hdr, 1, 44, fp) != 44) return false;
+
+    /* Check RIFF header */
+    if (memcmp(hdr, "RIFF", 4) != 0 || memcmp(hdr + 8, "WAVE", 4) != 0) return false;
+
+    /* fmt chunk */
+    *channels = hdr[22] | (hdr[23] << 8);
+    *sample_rate = hdr[24] | (hdr[25] << 8) | (hdr[26] << 16) | (hdr[27] << 24);
+    *bits_per_sample = hdr[34] | (hdr[35] << 8);
+
+    return true;
+}
+
+static void *voice_audio_thread_func(void *arg) {
+    VoiceConn *vc = (VoiceConn *)arg;
+
+    while (vc->active && !vc->stop_requested && !g_shutdown) {
+        /* Get next item from queue */
+        char filepath[256] = {0};
+
+        pthread_mutex_lock(&vc->voice_mutex);
+        if (vc->queue_count <= 0) {
+            pthread_mutex_unlock(&vc->voice_mutex);
+            /* Nothing to play, sleep and check again */
+            usleep(100000); /* 100ms */
+            continue;
+        }
+        snprintf(filepath, sizeof(filepath), "%s", vc->queue[vc->queue_head].path);
+        vc->queue_head = (vc->queue_head + 1) % MAX_AUDIO_QUEUE;
+        vc->queue_count--;
+        pthread_mutex_unlock(&vc->voice_mutex);
+
+        if (!filepath[0]) continue;
+
+        LOG_I("音声再生開始: %s", filepath);
+        vc->playing = true;
+        vc->paused = false;
+
+        /* Determine source: WAV file or pipe from ffmpeg */
+        FILE *fp = NULL;
+        bool use_ffmpeg = false;
+        const char *ext = strrchr(filepath, '.');
+
+        if (ext && (strcasecmp(ext, ".wav") == 0 || strcasecmp(ext, ".wave") == 0)) {
+            fp = fopen(filepath, "rb");
+            if (!fp) {
+                LOG_E("音声ファイルを開けません: %s", filepath);
+                vc->playing = false;
+                continue;
+            }
+            int channels, sample_rate, bps;
+            if (!wav_read_header(fp, &channels, &sample_rate, &bps)) {
+                LOG_E("WAVヘッダーが不正です: %s", filepath);
+                fclose(fp);
+                vc->playing = false;
+                continue;
+            }
+            LOG_D("WAV: ch=%d, sr=%d, bps=%d", channels, sample_rate, bps);
+            /* We expect 48kHz, 16bit, stereo for direct Opus encoding.
+             * If different, fall through to ffmpeg */
+            if (sample_rate != VOICE_SAMPLE_RATE || channels != VOICE_CHANNELS || bps != 16) {
+                fclose(fp);
+                fp = NULL;
+                use_ffmpeg = true;
+            }
+        } else {
+            use_ffmpeg = true;
+        }
+
+        if (use_ffmpeg) {
+            /* Use ffmpeg to convert any audio to 48kHz 16bit stereo PCM */
+            char cmd[1024];
+            snprintf(cmd, sizeof(cmd),
+                "ffmpeg -i \"%s\" -f s16le -ar %d -ac %d -loglevel error -",
+                filepath, VOICE_SAMPLE_RATE, VOICE_CHANNELS);
+            fp = popen(cmd, "r");
+            if (!fp) {
+                LOG_E("ffmpeg起動失敗: %s", filepath);
+                vc->playing = false;
+                continue;
+            }
+        }
+
+        /* Send SPEAKING */
+        voice_send_speaking(vc, true);
+
+        /* Initialize RTP counters */
+        vc->rtp_seq = 0;
+        vc->rtp_timestamp = 0;
+
+        /* Audio loop: read PCM, Opus encode, encrypt, send RTP */
+        int16_t pcm_buf[VOICE_FRAME_SIZE]; /* 960 * 2 = 1920 samples */
+        uint8_t opus_buf[VOICE_MAX_PACKET];
+        uint8_t packet[VOICE_MAX_PACKET + 12 + crypto_secretbox_MACBYTES];
+
+        struct timespec frame_start, frame_end;
+
+        while (vc->playing && !vc->stop_requested && !g_shutdown) {
+            /* Handle pause */
+            if (vc->paused) {
+                usleep(50000); /* 50ms */
+                continue;
+            }
+
+            clock_gettime(CLOCK_MONOTONIC, &frame_start);
+
+            /* Read PCM data (VOICE_FRAME_SIZE samples * 2 bytes) */
+            size_t read_bytes = fread(pcm_buf, sizeof(int16_t), VOICE_FRAME_SIZE, fp);
+            if (read_bytes == 0) {
+                /* EOF */
+                break;
+            }
+            /* Pad with silence if partial frame */
+            if ((int)read_bytes < VOICE_FRAME_SIZE) {
+                memset(pcm_buf + read_bytes, 0,
+                       (size_t)(VOICE_FRAME_SIZE - (int)read_bytes) * sizeof(int16_t));
+            }
+
+            /* Opus encode */
+            int opus_len = opus_encode(vc->opus_enc, pcm_buf, VOICE_FRAME_SAMPLES,
+                                       opus_buf, sizeof(opus_buf));
+            if (opus_len < 0) {
+                LOG_E("Opusエンコードエラー: %s", opus_strerror(opus_len));
+                break;
+            }
+
+            /* Build RTP header (12 bytes) */
+            uint8_t rtp_header[12];
+            rtp_header[0] = 0x80; /* Version 2 */
+            rtp_header[1] = 0x78; /* Payload type 120 */
+            rtp_header[2] = (vc->rtp_seq >> 8) & 0xFF;
+            rtp_header[3] = vc->rtp_seq & 0xFF;
+            rtp_header[4] = (vc->rtp_timestamp >> 24) & 0xFF;
+            rtp_header[5] = (vc->rtp_timestamp >> 16) & 0xFF;
+            rtp_header[6] = (vc->rtp_timestamp >> 8) & 0xFF;
+            rtp_header[7] = vc->rtp_timestamp & 0xFF;
+            rtp_header[8] = (vc->ssrc >> 24) & 0xFF;
+            rtp_header[9] = (vc->ssrc >> 16) & 0xFF;
+            rtp_header[10] = (vc->ssrc >> 8) & 0xFF;
+            rtp_header[11] = vc->ssrc & 0xFF;
+
+            /* XSalsa20-Poly1305 encryption:
+             * nonce = 24 bytes: RTP header (12) + 12 zero bytes */
+            uint8_t nonce[24];
+            memset(nonce, 0, sizeof(nonce));
+            memcpy(nonce, rtp_header, 12);
+
+            /* Encrypt opus data */
+            uint8_t encrypted[VOICE_MAX_PACKET + crypto_secretbox_MACBYTES];
+            if (crypto_secretbox_easy(encrypted, opus_buf, (unsigned long long)opus_len,
+                                      nonce, vc->secret_key) != 0) {
+                LOG_E("音声暗号化失敗");
+                break;
+            }
+
+            int encrypted_len = opus_len + (int)crypto_secretbox_MACBYTES;
+
+            /* Assemble final packet: RTP header + encrypted audio */
+            memcpy(packet, rtp_header, 12);
+            memcpy(packet + 12, encrypted, (size_t)encrypted_len);
+            int total_len = 12 + encrypted_len;
+
+            /* Send via UDP */
+            ssize_t sent = sendto(vc->udp_fd, packet, (size_t)total_len, 0,
+                                  (struct sockaddr *)&vc->udp_addr, sizeof(vc->udp_addr));
+            if (sent < 0) {
+                LOG_E("Voice UDP送信失敗: %s", strerror(errno));
+                break;
+            }
+
+            vc->rtp_seq++;
+            vc->rtp_timestamp += VOICE_FRAME_SAMPLES;
+
+            /* Sleep for remainder of 20ms frame */
+            clock_gettime(CLOCK_MONOTONIC, &frame_end);
+            long elapsed_ns = (frame_end.tv_sec - frame_start.tv_sec) * 1000000000L +
+                              (frame_end.tv_nsec - frame_start.tv_nsec);
+            long target_ns = VOICE_FRAME_MS * 1000000L; /* 20ms */
+            if (elapsed_ns < target_ns) {
+                struct timespec sleep_ts;
+                sleep_ts.tv_sec = 0;
+                sleep_ts.tv_nsec = target_ns - elapsed_ns;
+                nanosleep(&sleep_ts, NULL);
+            }
+        }
+
+        /* Send SPEAKING off + 5 frames of silence */
+        voice_send_speaking(vc, false);
+        for (int i = 0; i < 5 && vc->active; i++) {
+            /* Opus silence frame */
+            static const uint8_t silence[] = {0xF8, 0xFF, 0xFE};
+            uint8_t rtp_header[12];
+            rtp_header[0] = 0x80;
+            rtp_header[1] = 0x78;
+            rtp_header[2] = (vc->rtp_seq >> 8) & 0xFF;
+            rtp_header[3] = vc->rtp_seq & 0xFF;
+            rtp_header[4] = (vc->rtp_timestamp >> 24) & 0xFF;
+            rtp_header[5] = (vc->rtp_timestamp >> 16) & 0xFF;
+            rtp_header[6] = (vc->rtp_timestamp >> 8) & 0xFF;
+            rtp_header[7] = vc->rtp_timestamp & 0xFF;
+            rtp_header[8] = (vc->ssrc >> 24) & 0xFF;
+            rtp_header[9] = (vc->ssrc >> 16) & 0xFF;
+            rtp_header[10] = (vc->ssrc >> 8) & 0xFF;
+            rtp_header[11] = vc->ssrc & 0xFF;
+
+            uint8_t nonce[24];
+            memset(nonce, 0, sizeof(nonce));
+            memcpy(nonce, rtp_header, 12);
+
+            uint8_t enc_silence[3 + crypto_secretbox_MACBYTES];
+            crypto_secretbox_easy(enc_silence, silence, 3, nonce, vc->secret_key);
+
+            uint8_t pkt[12 + 3 + crypto_secretbox_MACBYTES];
+            memcpy(pkt, rtp_header, 12);
+            memcpy(pkt + 12, enc_silence, 3 + crypto_secretbox_MACBYTES);
+            sendto(vc->udp_fd, pkt, sizeof(pkt), 0,
+                   (struct sockaddr *)&vc->udp_addr, sizeof(vc->udp_addr));
+
+            vc->rtp_seq++;
+            vc->rtp_timestamp += VOICE_FRAME_SAMPLES;
+            usleep(VOICE_FRAME_MS * 1000);
+        }
+
+        /* Close file/pipe */
+        if (use_ffmpeg) {
+            pclose(fp);
+        } else {
+            fclose(fp);
+        }
+
+        vc->playing = false;
+        LOG_I("音声再生完了: %s", filepath);
+
+        /* Fire event */
+        Value done_val = hajimu_string(filepath);
+        event_fire("音声再生完了", 1, &done_val);
+        event_fire("VOICE_PLAY_END", 1, &done_val);
+
+        /* Check loop mode (re-queue) */
+        if (vc->loop_mode && !vc->stop_requested) {
+            pthread_mutex_lock(&vc->voice_mutex);
+            if (vc->queue_count < MAX_AUDIO_QUEUE) {
+                int tail = vc->queue_tail;
+                snprintf(vc->queue[tail].path, sizeof(vc->queue[tail].path), "%s", filepath);
+                vc->queue_tail = (vc->queue_tail + 1) % MAX_AUDIO_QUEUE;
+                vc->queue_count++;
+            }
+            pthread_mutex_unlock(&vc->voice_mutex);
+        }
+    }
+
+    LOG_I("音声スレッド終了 (guild=%s)", vc->guild_id);
+    return NULL;
+}
+
+/* --- Send Gateway op 4 (Voice State Update) --- */
+
+static void gw_send_voice_state(const char *guild_id, const char *channel_id) {
+    StrBuf sb; sb_init(&sb);
+    jb_obj_start(&sb);
+    jb_int(&sb, "op", GW_VOICE_STATE);
+    jb_key(&sb, "d"); jb_obj_start(&sb);
+    jb_str(&sb, "guild_id", guild_id);
+    if (channel_id) {
+        jb_str(&sb, "channel_id", channel_id);
+    } else {
+        jb_null(&sb, "channel_id");
+    }
+    jb_bool(&sb, "self_mute", false);
+    jb_bool(&sb, "self_deaf", false);
+    jb_obj_end(&sb); sb_append_char(&sb, ',');
+    jb_obj_end(&sb);
+    gw_send_json(sb.data);
+    sb_free(&sb);
 }
 
 /* =========================================================================
@@ -5306,6 +6223,261 @@ static Value fn_poll_end(int argc, Value *argv) {
 }
 
 /* =========================================================================
+ * v2.0.0: ボイスチャンネル対応
+ * ========================================================================= */
+
+/* VC接続(サーバーID, チャンネルID) — Join a voice channel */
+static Value fn_vc_join(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING) {
+        LOG_E("VC接続: サーバーID(文字列), チャンネルID(文字列)が必要です");
+        return hajimu_bool(false);
+    }
+    const char *guild_id = argv[0].string.data;
+    const char *channel_id = argv[1].string.data;
+
+    /* Check for existing connection */
+    VoiceConn *vc = voice_find(guild_id);
+    if (vc) {
+        LOG_W("VC接続: サーバー %s は既に接続中です", guild_id);
+        return hajimu_bool(false);
+    }
+
+    /* Allocate voice connection */
+    vc = voice_alloc(guild_id);
+    if (!vc) return hajimu_bool(false);
+
+    snprintf(vc->channel_id, sizeof(vc->channel_id), "%s", channel_id);
+    vc->waiting_for_state = true;
+    vc->waiting_for_server = true;
+    vc->state_received = false;
+    vc->server_received = false;
+
+    /* Start audio thread */
+    pthread_create(&vc->audio_thread, NULL, voice_audio_thread_func, vc);
+    pthread_detach(vc->audio_thread);
+
+    /* Send Gateway op 4 to join voice channel */
+    gw_send_voice_state(guild_id, channel_id);
+    LOG_I("VC接続リクエスト送信: guild=%s, channel=%s", guild_id, channel_id);
+
+    return hajimu_bool(true);
+}
+
+/* VC切断(サーバーID) — Leave a voice channel */
+static Value fn_vc_leave(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) {
+        LOG_E("VC切断: サーバーID(文字列)が必要です");
+        return hajimu_bool(false);
+    }
+    const char *guild_id = argv[0].string.data;
+
+    VoiceConn *vc = voice_find(guild_id);
+    if (!vc) {
+        LOG_W("VC切断: サーバー %s は接続されていません", guild_id);
+        return hajimu_bool(false);
+    }
+
+    /* Send Gateway op 4 with null channel to leave */
+    gw_send_voice_state(guild_id, NULL);
+
+    /* Clean up voice connection */
+    voice_free(vc);
+
+    LOG_I("VC切断完了: guild=%s", guild_id);
+
+    Value guild_val = hajimu_string(guild_id);
+    event_fire("ボイス切断", 1, &guild_val);
+    event_fire("VOICE_DISCONNECTED", 1, &guild_val);
+
+    return hajimu_bool(true);
+}
+
+/* 音声再生(サーバーID, ソース) — Play audio file */
+static Value fn_voice_play(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING) {
+        LOG_E("音声再生: サーバーID(文字列), ソース(文字列)が必要です");
+        return hajimu_bool(false);
+    }
+    const char *guild_id = argv[0].string.data;
+    const char *source = argv[1].string.data;
+
+    VoiceConn *vc = voice_find(guild_id);
+    if (!vc || !vc->ready) {
+        LOG_E("音声再生: ボイス接続が準備できていません (guild=%s)", guild_id);
+        return hajimu_bool(false);
+    }
+
+    /* Add to queue */
+    pthread_mutex_lock(&vc->voice_mutex);
+    if (vc->queue_count >= MAX_AUDIO_QUEUE) {
+        pthread_mutex_unlock(&vc->voice_mutex);
+        LOG_E("音声再生: キューが満杯です");
+        return hajimu_bool(false);
+    }
+    int tail = vc->queue_tail;
+    snprintf(vc->queue[tail].path, sizeof(vc->queue[tail].path), "%s", source);
+    vc->queue_tail = (vc->queue_tail + 1) % MAX_AUDIO_QUEUE;
+    vc->queue_count++;
+    pthread_mutex_unlock(&vc->voice_mutex);
+
+    LOG_I("音声キューに追加: %s", source);
+    return hajimu_bool(true);
+}
+
+/* 音声停止(サーバーID) — Stop playback and clear queue */
+static Value fn_voice_stop(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) {
+        LOG_E("音声停止: サーバーID(文字列)が必要です");
+        return hajimu_bool(false);
+    }
+    VoiceConn *vc = voice_find(argv[0].string.data);
+    if (!vc) return hajimu_bool(false);
+
+    pthread_mutex_lock(&vc->voice_mutex);
+    vc->playing = false;
+    vc->stop_requested = true;
+    /* Clear queue */
+    vc->queue_head = 0;
+    vc->queue_tail = 0;
+    vc->queue_count = 0;
+    pthread_mutex_unlock(&vc->voice_mutex);
+
+    LOG_I("音声停止: guild=%s", vc->guild_id);
+    return hajimu_bool(true);
+}
+
+/* 音声一時停止(サーバーID) — Pause playback */
+static Value fn_voice_pause(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) {
+        LOG_E("音声一時停止: サーバーID(文字列)が必要です");
+        return hajimu_bool(false);
+    }
+    VoiceConn *vc = voice_find(argv[0].string.data);
+    if (!vc || !vc->playing) return hajimu_bool(false);
+
+    vc->paused = true;
+    voice_send_speaking(vc, false);
+    LOG_I("音声一時停止: guild=%s", vc->guild_id);
+    return hajimu_bool(true);
+}
+
+/* 音声再開(サーバーID) — Resume playback */
+static Value fn_voice_resume(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) {
+        LOG_E("音声再開: サーバーID(文字列)が必要です");
+        return hajimu_bool(false);
+    }
+    VoiceConn *vc = voice_find(argv[0].string.data);
+    if (!vc || !vc->paused) return hajimu_bool(false);
+
+    vc->paused = false;
+    voice_send_speaking(vc, true);
+    LOG_I("音声再開: guild=%s", vc->guild_id);
+    return hajimu_bool(true);
+}
+
+/* 音声スキップ(サーバーID) — Skip current track */
+static Value fn_voice_skip(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) {
+        LOG_E("音声スキップ: サーバーID(文字列)が必要です");
+        return hajimu_bool(false);
+    }
+    VoiceConn *vc = voice_find(argv[0].string.data);
+    if (!vc) return hajimu_bool(false);
+
+    /* Stop current track (audio thread will pick next from queue) */
+    vc->playing = false;
+    vc->paused = false;
+    vc->stop_requested = false; /* Don't stop the thread, just skip */
+    LOG_I("音声スキップ: guild=%s", vc->guild_id);
+    return hajimu_bool(true);
+}
+
+/* 音声キュー(サーバーID) — Get current queue as array */
+static Value fn_voice_queue(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) {
+        LOG_E("音声キュー: サーバーID(文字列)が必要です");
+        return hajimu_array();
+    }
+    VoiceConn *vc = voice_find(argv[0].string.data);
+    if (!vc) return hajimu_array();
+
+    Value arr = hajimu_array();
+    pthread_mutex_lock(&vc->voice_mutex);
+    for (int i = 0; i < vc->queue_count; i++) {
+        int idx = (vc->queue_head + i) % MAX_AUDIO_QUEUE;
+        Value item = hajimu_string(vc->queue[idx].path);
+        hajimu_array_push(&arr, item);
+    }
+    pthread_mutex_unlock(&vc->voice_mutex);
+    return arr;
+}
+
+/* 音声ループ(サーバーID, 有効) — Toggle loop mode */
+static Value fn_voice_loop(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_BOOL) {
+        LOG_E("音声ループ: サーバーID(文字列), 有効(真偽)が必要です");
+        return hajimu_bool(false);
+    }
+    VoiceConn *vc = voice_find(argv[0].string.data);
+    if (!vc) return hajimu_bool(false);
+
+    vc->loop_mode = argv[1].boolean;
+    LOG_I("音声ループ %s: guild=%s", vc->loop_mode ? "有効" : "無効", vc->guild_id);
+    return hajimu_bool(true);
+}
+
+/* VC状態(サーバーID) — Get voice connection status */
+static Value fn_vc_status(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) {
+        LOG_E("VC状態: サーバーID(文字列)が必要です");
+        return hajimu_null();
+    }
+    VoiceConn *vc = voice_find(argv[0].string.data);
+    if (!vc) return hajimu_null();
+
+    /* Return a map-like string with status info */
+    char buf[512];
+    snprintf(buf, sizeof(buf),
+        "{\"接続中\":true,\"チャンネル\":\"%s\",\"再生中\":%s,"
+        "\"一時停止\":%s,\"キュー数\":%d,\"ループ\":%s}",
+        vc->channel_id,
+        vc->playing ? "true" : "false",
+        vc->paused ? "true" : "false",
+        vc->queue_count,
+        vc->loop_mode ? "true" : "false");
+
+    /* Parse as value */
+    JsonNode *node = json_parse(buf);
+    if (node) {
+        Value val = json_to_value(node);
+        json_free(node);
+        return val;
+    }
+    return hajimu_string(buf);
+}
+
+/* 音声音量(サーバーID, 音量) — Set Opus encoder bitrate (proxy for volume) */
+static Value fn_voice_volume(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_NUMBER) {
+        LOG_E("音声音量: サーバーID(文字列), 音量(数値 1-200)が必要です");
+        return hajimu_bool(false);
+    }
+    VoiceConn *vc = voice_find(argv[0].string.data);
+    if (!vc || !vc->opus_enc) return hajimu_bool(false);
+
+    int vol = (int)argv[1].number;
+    if (vol < 1) vol = 1;
+    if (vol > 200) vol = 200;
+
+    /* Map volume percentage to bitrate: 100% = 64kbps, 200% = 128kbps */
+    int bitrate = 640 * vol;
+    opus_encoder_ctl(vc->opus_enc, OPUS_SET_BITRATE(bitrate));
+    LOG_I("音声ビットレート設定: %d bps (volume=%d%%)", bitrate, vol);
+    return hajimu_bool(true);
+}
+
+/* =========================================================================
  * Section 15: Plugin Registration
  * ========================================================================= */
 
@@ -5458,6 +6630,19 @@ static HajimuPluginFunc functions[] = {
     {"イベント一覧",         fn_event_list,        1,  1},
     {"投票作成",             fn_poll_create,       4,  5},
     {"投票終了",             fn_poll_end,          2,  2},
+
+    /* ボイスチャンネル (v2.0.0) */
+    {"VC接続",               fn_vc_join,           2,  2},
+    {"VC切断",               fn_vc_leave,          1,  1},
+    {"音声再生",             fn_voice_play,        2,  2},
+    {"音声停止",             fn_voice_stop,        1,  1},
+    {"音声一時停止",         fn_voice_pause,       1,  1},
+    {"音声再開",             fn_voice_resume,      1,  1},
+    {"音声スキップ",         fn_voice_skip,        1,  1},
+    {"音声キュー",           fn_voice_queue,       1,  1},
+    {"音声ループ",           fn_voice_loop,        2,  2},
+    {"VC状態",               fn_vc_status,         1,  1},
+    {"音声音量",             fn_voice_volume,      2,  2},
 
     /* サーバー */
     {"サーバー情報",         fn_guild_info,        1,  1},

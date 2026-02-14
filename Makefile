@@ -25,14 +25,24 @@ OPENSSL_PREFIX ?= $(shell \
 	elif [ -d "/usr/local/opt/openssl" ]; then echo "/usr/local/opt/openssl"; \
 	else echo "/usr"; fi)
 
+# Opus パス (v2.0.0: ボイスチャンネル)
+OPUS_CFLAGS  ?= $(shell pkg-config --cflags opus 2>/dev/null || echo "-I/opt/homebrew/include/opus")
+OPUS_LDFLAGS ?= $(shell pkg-config --libs opus 2>/dev/null || echo "-L/opt/homebrew/lib -lopus")
+
+# libsodium パス (v2.0.0: 音声暗号化)
+SODIUM_CFLAGS  ?= $(shell pkg-config --cflags libsodium 2>/dev/null || echo "-I/opt/homebrew/include")
+SODIUM_LDFLAGS ?= $(shell pkg-config --libs libsodium 2>/dev/null || echo "-L/opt/homebrew/lib -lsodium")
+
 # コンパイルフラグ
 CFLAGS  = -Wall -Wextra -O2 -std=c11 -fPIC
 CFLAGS += -I$(HAJIMU_INCLUDE)
 CFLAGS += -I$(OPENSSL_PREFIX)/include
+CFLAGS += $(OPUS_CFLAGS) $(SODIUM_CFLAGS)
 
 # リンクフラグ
 LDFLAGS  = -L$(OPENSSL_PREFIX)/lib
 LDFLAGS += -lcurl -lssl -lcrypto -lz -lpthread
+LDFLAGS += $(OPUS_LDFLAGS) $(SODIUM_LDFLAGS)
 
 # OS 判定
 UNAME_S := $(shell uname -s)
@@ -111,7 +121,9 @@ help:
 	@echo ""
 	@echo "  依存ライブラリ:"
 	@echo "    libcurl, OpenSSL (libssl + libcrypto), zlib, pthread"
+	@echo "    libopus (v2.0.0: ボイスチャンネル)"
+	@echo "    libsodium (v2.0.0: 音声暗号化)"
 	@echo ""
-	@echo "  macOS: brew install openssl curl"
-	@echo "  Ubuntu: sudo apt install libcurl4-openssl-dev libssl-dev zlib1g-dev"
+	@echo "  macOS: brew install openssl curl opus libsodium"
+	@echo "  Ubuntu: sudo apt install libcurl4-openssl-dev libssl-dev zlib1g-dev libopus-dev libsodium-dev"
 	@echo ""

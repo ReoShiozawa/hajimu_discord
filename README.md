@@ -2,7 +2,7 @@
   <img src="https://img.shields.io/badge/言語-はじむ-ff6b6b?style=for-the-badge" alt="はじむ">
   <img src="https://img.shields.io/badge/Discord_API-v10-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord API v10">
   <img src="https://img.shields.io/badge/license-MIT-green?style=for-the-badge" alt="MIT License">
-  <img src="https://img.shields.io/badge/version-1.7.1-blue?style=for-the-badge" alt="v1.7.1">
+  <img src="https://img.shields.io/badge/version-2.0.0-blue?style=for-the-badge" alt="v2.0.0">
 </p>
 
 # hajimu_discord — はじむ言語用 Discord Bot 開発プラグイン
@@ -396,6 +396,25 @@ Discord でサーバーに `!hello` と送ると、Bot が「こんにちは！�
     ["はじむ", "Python", "JavaScript", "Rust"], 24, 真)
 ```
 
+### Step 16: ボイスチャンネル <sup>v2.0</sup>
+
+```
+// ボイスチャンネルに参加して音声を再生
+ボット.VC接続(サーバーID, ボイスチャンネルID)
+
+// 接続完了イベントを待って再生開始
+ボット.イベント("ボイス接続完了", 関数(ギルドID):
+    ボット.音声再生(ギルドID, "/path/to/music.mp3")
+)
+
+// 音声制御
+ボット.音声一時停止(サーバーID)   // 一時停止
+ボット.音声再開(サーバーID)       // 再開
+ボット.音声スキップ(サーバーID)   // スキップ
+ボット.音声ループ(サーバーID, 真) // ループ有効
+ボット.VC切断(サーバーID)         // 退出
+```
+
 ---
 
 ## 📚 API リファレンス
@@ -684,6 +703,24 @@ Discord でサーバーに `!hello` と送ると、Bot が「こんにちは！�
 | `投票作成(チャンネルID, 質問, 選択肢配列, 時間h[, 複数選択])` | 文字列, 文字列, 配列, 数値[, 真偽] | 投票を作成（1-168時間） |
 | `投票終了(チャンネルID, メッセージID)` | 文字列×2 | 投票を即時終了 |
 
+### ボイスチャンネル <sup>v2.0</sup>
+
+| 関数 | 引数 | 説明 |
+|---|---|---|
+| `VC接続(サーバーID, チャンネルID)` | 文字列×2 | ボイスチャンネルに参加 |
+| `VC切断(サーバーID)` | 文字列 | ボイスチャンネルから退出 |
+| `音声再生(サーバーID, ソース)` | 文字列×2 | 音声ファイルを再生（WAV/MP3/OGG等） |
+| `音声停止(サーバーID)` | 文字列 | 再生停止＆キュークリア |
+| `音声一時停止(サーバーID)` | 文字列 | 再生を一時停止 |
+| `音声再開(サーバーID)` | 文字列 | 一時停止から再開 |
+| `音声スキップ(サーバーID)` | 文字列 | 現在の曲をスキップ |
+| `音声キュー(サーバーID)` | 文字列 | キュー内の曲一覧を取得 |
+| `音声ループ(サーバーID, 有効)` | 文字列, 真偽 | ループ再生モード切替 |
+| `VC状態(サーバーID)` | 文字列 | 接続状態・再生情報を取得 |
+| `音声音量(サーバーID, 音量)` | 文字列, 数値 | 音量調整（1-200%） |
+
+> **依存**: `libopus`, `libsodium`, `ffmpeg`（MP3等の非WAVファイル再生時）
+
 ### モデレーション
 
 | 関数 | 引数 | 説明 |
@@ -730,6 +767,10 @@ Discord でサーバーに `!hello` と送ると、Bot が「こんにちは！�
 | `"入力中"` | TYPING_START | 入力中 |
 | `"プレゼンス更新"` | PRESENCE_UPDATE | プレゼンス更新 |
 | `"ボイス状態更新"` | VOICE_STATE_UPDATE | ボイス状態変更 |
+| `"ボイスサーバー更新"` | VOICE_SERVER_UPDATE | ボイスサーバー情報更新 |
+| `"ボイス接続完了"` | VOICE_CONNECTED | VC接続完了（音声送信可能） |
+| `"ボイス切断"` | VOICE_DISCONNECTED | VC切断完了 |
+| `"音声再生完了"` | VOICE_PLAY_END | 1曲の再生が完了 |
 | `"準備完了"` | READY | Bot接続完了 |
 | `"再接続完了"` | RESUMED | セッション再開完了 |
 | `"エラー"` | — | REST/Gateway エラー発生 |
@@ -908,6 +949,23 @@ v1.0.0 では未対応です。v2.0 で対応予定です。
 ---
 
 ## 📜 変更履歴
+
+### v2.0.0 (2026-02-15)
+
+**ボイスチャンネル対応** — +11関数
+
+- **VC接続 / VC切断**: ボイスチャンネルへの参加・退出
+- **音声再生**: WAV/MP3/OGG等のファイル再生（ffmpeg対応）
+- **音声停止 / 一時停止 / 再開 / スキップ**: 再生制御
+- **音声キュー管理**: 複数曲の順次再生
+- **音声ループ**: リピート再生モード
+- **VC状態**: 接続状態・再生状況の取得
+- **音声音量**: Opusビットレート調整（音量制御）
+- Voice Gateway + UDP + RTP + XSalsa20-Poly1305 暗号化
+- Opus エンコーダー（48kHz, ステレオ, 20ms フレーム）
+- IP Discovery 自動認識
+- 依存追加: libopus, libsodium
+- 累計 ~135 関数
 
 ### v1.7.1 (2026-02-14)
 

@@ -8455,6 +8455,115 @@ static Value fn_sticker_packs(int argc, Value *argv) {
     return result;
 }
 
+/* ────────────────────────────────────────────────────
+ * .env ファイル読み込み
+ * ──────────────────────────────────────────────────── */
+
+/* env値の内部ストレージ (最大256エントリ) */
+#define ENV_MAX 256
+static struct {
+    char key[128];
+    char value[1024];
+} g_env_entries[ENV_MAX];
+static int g_env_count = 0;
+
+/* 内部: .env の1行をパースして setenv + 内部テーブルに格納 */
+static void env_parse_line(const char *line) {
+    /* 空行・コメント行をスキップ */
+    while (*line == ' ' || *line == '\t') line++;
+    if (*line == '\0' || *line == '#' || *line == '\n') return;
+
+    /* KEY=VALUE を分離 */
+    const char *eq = strchr(line, '=');
+    if (!eq) return;
+
+    /* KEY を取得 (前後の空白を除去) */
+    size_t klen = (size_t)(eq - line);
+    while (klen > 0 && (line[klen-1] == ' ' || line[klen-1] == '\t')) klen--;
+    if (klen == 0 || klen >= 128) return;
+
+    char key[128];
+    memcpy(key, line, klen);
+    key[klen] = '\0';
+
+    /* VALUE を取得 (先頭の空白とクォートを除去) */
+    const char *vstart = eq + 1;
+    while (*vstart == ' ' || *vstart == '\t') vstart++;
+
+    char value[1024];
+    size_t vlen = strlen(vstart);
+
+    /* 末尾の改行・空白を除去 */
+    while (vlen > 0 && (vstart[vlen-1] == '\n' || vstart[vlen-1] == '\r'
+                        || vstart[vlen-1] == ' ' || vstart[vlen-1] == '\t'))
+        vlen--;
+
+    /* クォート (' or ") の除去 */
+    if (vlen >= 2 &&
+        ((vstart[0] == '"' && vstart[vlen-1] == '"') ||
+         (vstart[0] == '\'' && vstart[vlen-1] == '\''))) {
+        vstart++;
+        vlen -= 2;
+    }
+    if (vlen >= sizeof(value)) vlen = sizeof(value) - 1;
+    memcpy(value, vstart, vlen);
+    value[vlen] = '\0';
+
+    /* 環境変数にセット (既存なら上書きしない: overwrite=0) */
+    setenv(key, value, 0);
+
+    /* 内部テーブルに保存 */
+    if (g_env_count < ENV_MAX) {
+        strncpy(g_env_entries[g_env_count].key, key, 127);
+        g_env_entries[g_env_count].key[127] = '\0';
+        strncpy(g_env_entries[g_env_count].value, value, 1023);
+        g_env_entries[g_env_count].value[1023] = '\0';
+        g_env_count++;
+    }
+}
+
+/* env読み込み([ファイルパス]) — .env を読み込んで環境変数に設定 */
+static Value fn_env_load(int argc, Value *argv) {
+    const char *path = ".env";
+    if (argc >= 1 && argv[0].type == VALUE_STRING)
+        path = argv[0].string.data;
+
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        fprintf(stderr, "[hajimu_discord] .env ファイルが見つかりません: %s\n", path);
+        return hajimu_bool(false);
+    }
+
+    char line[2048];
+    int count = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        int before = g_env_count;
+        env_parse_line(line);
+        if (g_env_count > before) count++;
+    }
+    fclose(fp);
+
+    if (g_bot.log_level >= 1)
+        fprintf(stderr, "[hajimu_discord] .env 読み込み完了: %s (%d 件)\n", path, count);
+
+    return hajimu_bool(true);
+}
+
+/* env取得(キー[, デフォルト値]) — 環境変数を取得 */
+static Value fn_env_get(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING)
+        return hajimu_null();
+
+    const char *val = getenv(argv[0].string.data);
+    if (val) return hajimu_string(val);
+
+    /* デフォルト値 */
+    if (argc >= 2 && argv[1].type == VALUE_STRING)
+        return hajimu_string(argv[1].string.data);
+
+    return hajimu_null();
+}
+
 /* チャンネル位置変更(サーバーID, 変更内容JSON配列) */
 static Value fn_channel_position(int argc, Value *argv) {
     if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING)
@@ -9033,6 +9142,10 @@ static HajimuPluginFunc functions[] = {
     {"アプリ情報",               fn_app_info,                  0,  0},
     {"Voice地域一覧",            fn_voice_regions,             0,  0},
     {"ステッカーパック一覧",     fn_sticker_packs,             0,  0},
+
+    /* .env */
+    {"env読み込み",               fn_env_load,                  0,  1},
+    {"env取得",                   fn_env_get,                   1,  2},
 };
 
 HAJIMU_PLUGIN_EXPORT HajimuPluginInfo *hajimu_plugin_init(void) {

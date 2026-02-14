@@ -24,6 +24,13 @@
  * v2.2.1 — 2026-02-15  セキュリティ・バグ修正 (JSONパーサ境界チェック, User-Agent統一,
  *                       OAuth2メモリ安全性, pthread UB修正, 音声停止ロジック修正,
  *                       ffmpegコマンドインジェクション防止, シャード検証追加)
+ * v2.3.0 — 2026-02-15  discord.js/discord.py互換性強化 — 自動選択メニュー(User/Role/
+ *                       Channel/Mentionable), BAN一覧/一括, メンバー編集, ニックネーム,
+ *                       Webhook編集/情報, スレッド一覧/アーカイブ/ロック/ピン, クロスポスト,
+ *                       チャンネルフォロー, プルーン, サーバー削除/プレビュー/ウィジェット,
+ *                       バニティURL, チャンネル/ロール位置変更, リアクションユーザー一覧,
+ *                       コマンド管理(削除/一覧/権限), Snowflakeタイムスタンプ, 権限計算,
+ *                       アプリ情報, Voice地域一覧, Gatewayイベント40種対応
  */
 
 #define _GNU_SOURCE
@@ -65,7 +72,7 @@
  * ========================================================================= */
 
 #define PLUGIN_NAME    "hajimu_discord"
-#define PLUGIN_VERSION "2.2.1"
+#define PLUGIN_VERSION "2.3.0"
 
 /* User-Agent (version auto-embedded) */
 #define DISCORD_USER_AGENT "User-Agent: DiscordBot (hajimu_discord, " PLUGIN_VERSION ")"
@@ -2068,6 +2075,78 @@ static void gw_handle_dispatch(const char *event_name, JsonNode *data) {
     } else if (strcmp(event_name, "RESUMED") == 0) {
         event_fire("再接続完了", 1, &val);
         LOG_I("セッション再開完了");
+    }
+    /* v2.3.0: 追加イベント — discord.js/discord.py 互換 */
+    else if (strcmp(event_name, "CHANNEL_UPDATE") == 0) {
+        event_fire("チャンネル更新", 1, &val);
+    } else if (strcmp(event_name, "CHANNEL_PINS_UPDATE") == 0) {
+        event_fire("ピン更新", 1, &val);
+    } else if (strcmp(event_name, "GUILD_UPDATE") == 0) {
+        event_fire("サーバー更新", 1, &val);
+    } else if (strcmp(event_name, "GUILD_BAN_ADD") == 0) {
+        event_fire("BAN追加", 1, &val);
+    } else if (strcmp(event_name, "GUILD_BAN_REMOVE") == 0) {
+        event_fire("BAN削除", 1, &val);
+    } else if (strcmp(event_name, "GUILD_EMOJIS_UPDATE") == 0) {
+        event_fire("絵文字更新", 1, &val);
+    } else if (strcmp(event_name, "GUILD_STICKERS_UPDATE") == 0) {
+        event_fire("スタンプ更新", 1, &val);
+    } else if (strcmp(event_name, "GUILD_MEMBER_UPDATE") == 0) {
+        event_fire("メンバー更新", 1, &val);
+    } else if (strcmp(event_name, "GUILD_ROLE_CREATE") == 0) {
+        event_fire("ロール作成", 1, &val);
+    } else if (strcmp(event_name, "GUILD_ROLE_UPDATE") == 0) {
+        event_fire("ロール更新", 1, &val);
+    } else if (strcmp(event_name, "GUILD_ROLE_DELETE") == 0) {
+        event_fire("ロール削除", 1, &val);
+    } else if (strcmp(event_name, "GUILD_INTEGRATIONS_UPDATE") == 0) {
+        event_fire("インテグレーション更新", 1, &val);
+    } else if (strcmp(event_name, "INVITE_CREATE") == 0) {
+        event_fire("招待作成", 1, &val);
+    } else if (strcmp(event_name, "INVITE_DELETE") == 0) {
+        event_fire("招待削除", 1, &val);
+    } else if (strcmp(event_name, "MESSAGE_DELETE_BULK") == 0) {
+        event_fire("メッセージ一括削除", 1, &val);
+    } else if (strcmp(event_name, "THREAD_CREATE") == 0) {
+        event_fire("スレッド作成", 1, &val);
+    } else if (strcmp(event_name, "THREAD_UPDATE") == 0) {
+        event_fire("スレッド更新", 1, &val);
+    } else if (strcmp(event_name, "THREAD_DELETE") == 0) {
+        event_fire("スレッド削除", 1, &val);
+    } else if (strcmp(event_name, "THREAD_LIST_SYNC") == 0) {
+        event_fire("スレッド同期", 1, &val);
+    } else if (strcmp(event_name, "THREAD_MEMBER_UPDATE") == 0) {
+        event_fire("スレッドメンバー更新", 1, &val);
+    } else if (strcmp(event_name, "THREAD_MEMBERS_UPDATE") == 0) {
+        event_fire("スレッドメンバーズ更新", 1, &val);
+    } else if (strcmp(event_name, "WEBHOOKS_UPDATE") == 0) {
+        event_fire("Webhook更新", 1, &val);
+    } else if (strcmp(event_name, "STAGE_INSTANCE_CREATE") == 0) {
+        event_fire("ステージ開始", 1, &val);
+    } else if (strcmp(event_name, "STAGE_INSTANCE_UPDATE") == 0) {
+        event_fire("ステージ更新", 1, &val);
+    } else if (strcmp(event_name, "STAGE_INSTANCE_DELETE") == 0) {
+        event_fire("ステージ終了", 1, &val);
+    } else if (strcmp(event_name, "GUILD_SCHEDULED_EVENT_USER_ADD") == 0) {
+        event_fire("イベント参加", 1, &val);
+    } else if (strcmp(event_name, "GUILD_SCHEDULED_EVENT_USER_REMOVE") == 0) {
+        event_fire("イベント退出", 1, &val);
+    } else if (strcmp(event_name, "MESSAGE_POLL_VOTE_ADD") == 0) {
+        event_fire("投票追加", 1, &val);
+    } else if (strcmp(event_name, "MESSAGE_POLL_VOTE_REMOVE") == 0) {
+        event_fire("投票削除", 1, &val);
+    } else if (strcmp(event_name, "ENTITLEMENT_CREATE") == 0) {
+        event_fire("エンタイトルメント作成", 1, &val);
+    } else if (strcmp(event_name, "ENTITLEMENT_UPDATE") == 0) {
+        event_fire("エンタイトルメント更新", 1, &val);
+    } else if (strcmp(event_name, "ENTITLEMENT_DELETE") == 0) {
+        event_fire("エンタイトルメント削除", 1, &val);
+    } else if (strcmp(event_name, "AUTO_MODERATION_RULE_CREATE") == 0) {
+        event_fire("自動モデレーションルール作成", 1, &val);
+    } else if (strcmp(event_name, "AUTO_MODERATION_RULE_UPDATE") == 0) {
+        event_fire("自動モデレーションルール更新", 1, &val);
+    } else if (strcmp(event_name, "AUTO_MODERATION_RULE_DELETE") == 0) {
+        event_fire("自動モデレーションルール削除", 1, &val);
     }
 }
 
@@ -7879,6 +7958,714 @@ static Value fn_shard_id_for(int argc, Value *argv) {
 }
 
 /* =========================================================================
+ * Section 14.5: v2.3.0 — 互換性強化 (discord.js/discord.py 機能対応)
+ * ========================================================================= */
+
+/* --- Auto-populated Select Menus (User/Role/Channel/Mentionable) --- */
+
+/* ユーザーセレクト作成(カスタムID [, プレースホルダー]) */
+static Value fn_user_select_create(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_null();
+    StrBuf sb; sb_init(&sb);
+    sb_append(&sb, "{\"type\":5,\"custom_id\":\"");
+    sb_append(&sb, argv[0].string.data);
+    sb_append(&sb, "\"");
+    if (argc >= 2 && argv[1].type == VALUE_STRING) {
+        sb_append(&sb, ",\"placeholder\":\"");
+        sb_append(&sb, argv[1].string.data);
+        sb_append(&sb, "\"");
+    }
+    sb_append(&sb, "}");
+    Value result = hajimu_string(sb.data);
+    sb_free(&sb);
+    return result;
+}
+
+/* ロールセレクト作成(カスタムID [, プレースホルダー]) */
+static Value fn_role_select_create(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_null();
+    StrBuf sb; sb_init(&sb);
+    sb_append(&sb, "{\"type\":6,\"custom_id\":\"");
+    sb_append(&sb, argv[0].string.data);
+    sb_append(&sb, "\"");
+    if (argc >= 2 && argv[1].type == VALUE_STRING) {
+        sb_append(&sb, ",\"placeholder\":\"");
+        sb_append(&sb, argv[1].string.data);
+        sb_append(&sb, "\"");
+    }
+    sb_append(&sb, "}");
+    Value result = hajimu_string(sb.data);
+    sb_free(&sb);
+    return result;
+}
+
+/* チャンネルセレクト作成(カスタムID [, プレースホルダー]) */
+static Value fn_channel_select_create(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_null();
+    StrBuf sb; sb_init(&sb);
+    sb_append(&sb, "{\"type\":8,\"custom_id\":\"");
+    sb_append(&sb, argv[0].string.data);
+    sb_append(&sb, "\"");
+    if (argc >= 2 && argv[1].type == VALUE_STRING) {
+        sb_append(&sb, ",\"placeholder\":\"");
+        sb_append(&sb, argv[1].string.data);
+        sb_append(&sb, "\"");
+    }
+    sb_append(&sb, "}");
+    Value result = hajimu_string(sb.data);
+    sb_free(&sb);
+    return result;
+}
+
+/* メンション可能セレクト作成(カスタムID [, プレースホルダー]) */
+static Value fn_mentionable_select_create(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_null();
+    StrBuf sb; sb_init(&sb);
+    sb_append(&sb, "{\"type\":7,\"custom_id\":\"");
+    sb_append(&sb, argv[0].string.data);
+    sb_append(&sb, "\"");
+    if (argc >= 2 && argv[1].type == VALUE_STRING) {
+        sb_append(&sb, ",\"placeholder\":\"");
+        sb_append(&sb, argv[1].string.data);
+        sb_append(&sb, "\"");
+    }
+    sb_append(&sb, "}");
+    Value result = hajimu_string(sb.data);
+    sb_free(&sb);
+    return result;
+}
+
+/* --- BAN管理拡張 --- */
+
+/* BAN一覧(サーバーID [, 上限]) */
+static Value fn_ban_list(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_null();
+    char endpoint[256];
+    if (argc >= 2 && argv[1].type == VALUE_NUMBER) {
+        snprintf(endpoint, sizeof(endpoint), "/guilds/%s/bans?limit=%d",
+                 argv[0].string.data, (int)argv[1].number);
+    } else {
+        snprintf(endpoint, sizeof(endpoint), "/guilds/%s/bans", argv[0].string.data);
+    }
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", endpoint, NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* BAN一括(サーバーID, ユーザーID配列 [, 削除秒数]) */
+static Value fn_bulk_ban(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_ARRAY)
+        return hajimu_null();
+    char endpoint[256];
+    snprintf(endpoint, sizeof(endpoint), "/guilds/%s/bulk-ban", argv[0].string.data);
+    StrBuf sb; sb_init(&sb);
+    sb_append(&sb, "{\"user_ids\":[");
+    for (int i = 0; i < argv[1].array.length; i++) {
+        if (i > 0) sb_append_char(&sb, ',');
+        if (argv[1].array.elements[i].type == VALUE_STRING) {
+            sb_append_char(&sb, '"');
+            sb_append(&sb, argv[1].array.elements[i].string.data);
+            sb_append_char(&sb, '"');
+        }
+    }
+    sb_append(&sb, "]");
+    if (argc >= 3 && argv[2].type == VALUE_NUMBER) {
+        char tmp[64];
+        snprintf(tmp, sizeof(tmp), ",\"delete_message_seconds\":%d", (int)argv[2].number);
+        sb_append(&sb, tmp);
+    }
+    sb_append(&sb, "}");
+    long code = 0;
+    JsonNode *resp = discord_rest("POST", endpoint, sb.data, &code);
+    sb_free(&sb);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* --- メンバー管理拡張 --- */
+
+/* メンバー編集(サーバーID, ユーザーID, 変更内容) */
+static Value fn_member_edit(int argc, Value *argv) {
+    if (argc < 3 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING ||
+        argv[2].type != VALUE_STRING) return hajimu_bool(false);
+    char endpoint[256];
+    snprintf(endpoint, sizeof(endpoint), "/guilds/%s/members/%s",
+             argv[0].string.data, argv[1].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("PATCH", endpoint, argv[2].string.data, &code);
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code >= 200 && code < 300);
+}
+
+/* ニックネーム変更(サーバーID, ニックネーム) */
+static Value fn_nick_change(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING)
+        return hajimu_bool(false);
+    char endpoint[256];
+    snprintf(endpoint, sizeof(endpoint), "/guilds/%s/members/@me", argv[0].string.data);
+    StrBuf sb; sb_init(&sb);
+    sb_append(&sb, "{\"nick\":\"");
+    StrBuf esc; sb_init(&esc);
+    json_escape_str(&esc, argv[1].string.data);
+    sb_append(&sb, esc.data);
+    sb_free(&esc);
+    sb_append(&sb, "\"}");
+    long code = 0;
+    JsonNode *resp = discord_rest("PATCH", endpoint, sb.data, &code);
+    sb_free(&sb);
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code >= 200 && code < 300);
+}
+
+/* --- Webhook拡張 --- */
+
+/* Webhook編集(WebhookID, 変更内容JSON) */
+static Value fn_webhook_edit(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING)
+        return hajimu_null();
+    char endpoint[128];
+    snprintf(endpoint, sizeof(endpoint), "/webhooks/%s", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("PATCH", endpoint, argv[1].string.data, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* Webhook情報(WebhookID) */
+static Value fn_webhook_info(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_null();
+    char endpoint[128];
+    snprintf(endpoint, sizeof(endpoint), "/webhooks/%s", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", endpoint, NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* --- スレッド拡張 --- */
+
+/* アクティブスレッド一覧(サーバーID) */
+static Value fn_active_threads(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_null();
+    char endpoint[256];
+    snprintf(endpoint, sizeof(endpoint), "/guilds/%s/threads/active", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", endpoint, NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* アーカイブスレッド一覧(チャンネルID [, "public"/"private"]) */
+static Value fn_archived_threads(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_null();
+    const char *kind = "public";
+    if (argc >= 2 && argv[1].type == VALUE_STRING) kind = argv[1].string.data;
+    char endpoint[256];
+    snprintf(endpoint, sizeof(endpoint), "/channels/%s/threads/archived/%s",
+             argv[0].string.data, kind);
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", endpoint, NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* --- アナウンスチャンネル対応 --- */
+
+/* クロスポスト(チャンネルID, メッセージID) */
+static Value fn_crosspost(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING)
+        return hajimu_null();
+    char endpoint[256];
+    snprintf(endpoint, sizeof(endpoint), "/channels/%s/messages/%s/crosspost",
+             argv[0].string.data, argv[1].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("POST", endpoint, NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* チャンネルフォロー(ソースチャンネルID, ターゲットチャンネルID) */
+static Value fn_channel_follow(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING)
+        return hajimu_null();
+    char endpoint[256];
+    snprintf(endpoint, sizeof(endpoint), "/channels/%s/followers", argv[0].string.data);
+    StrBuf sb; sb_init(&sb);
+    sb_append(&sb, "{\"webhook_channel_id\":\"");
+    sb_append(&sb, argv[1].string.data);
+    sb_append(&sb, "\"}");
+    long code = 0;
+    JsonNode *resp = discord_rest("POST", endpoint, sb.data, &code);
+    sb_free(&sb);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* --- サーバー管理拡張 --- */
+
+/* プルーン確認(サーバーID [, 日数]) */
+static Value fn_prune_count(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_null();
+    int days = 7;
+    if (argc >= 2 && argv[1].type == VALUE_NUMBER) days = (int)argv[1].number;
+    char endpoint[256];
+    snprintf(endpoint, sizeof(endpoint), "/guilds/%s/prune?days=%d",
+             argv[0].string.data, days);
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", endpoint, NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* プルーン実行(サーバーID [, 日数]) */
+static Value fn_prune(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_null();
+    int days = 7;
+    if (argc >= 2 && argv[1].type == VALUE_NUMBER) days = (int)argv[1].number;
+    char endpoint[256];
+    snprintf(endpoint, sizeof(endpoint), "/guilds/%s/prune", argv[0].string.data);
+    char body[64];
+    snprintf(body, sizeof(body), "{\"days\":%d}", days);
+    long code = 0;
+    JsonNode *resp = discord_rest("POST", endpoint, body, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* サーバー削除(サーバーID) — ボットがオーナーの場合のみ */
+static Value fn_guild_delete(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_bool(false);
+    char endpoint[128];
+    snprintf(endpoint, sizeof(endpoint), "/guilds/%s", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("DELETE", endpoint, NULL, &code);
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code == 204);
+}
+
+/* サーバープレビュー(サーバーID) */
+static Value fn_guild_preview(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_null();
+    char endpoint[128];
+    snprintf(endpoint, sizeof(endpoint), "/guilds/%s/preview", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", endpoint, NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* ウィジェット設定取得(サーバーID) */
+static Value fn_widget_settings_get(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_null();
+    char endpoint[128];
+    snprintf(endpoint, sizeof(endpoint), "/guilds/%s/widget", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", endpoint, NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* ウィジェット設定更新(サーバーID, 設定JSON) */
+static Value fn_widget_settings_edit(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING)
+        return hajimu_bool(false);
+    char endpoint[128];
+    snprintf(endpoint, sizeof(endpoint), "/guilds/%s/widget", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("PATCH", endpoint, argv[1].string.data, &code);
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code == 200);
+}
+
+/* バニティURL取得(サーバーID) */
+static Value fn_vanity_url(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_null();
+    char endpoint[128];
+    snprintf(endpoint, sizeof(endpoint), "/guilds/%s/vanity-url", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", endpoint, NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* Voice地域一覧() */
+static Value fn_voice_regions(int argc, Value *argv) {
+    (void)argc; (void)argv;
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", "/voice/regions", NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* --- ユーティリティ拡張 --- */
+
+/* Snowflakeタイムスタンプ(ID) — Discord ID → Unix timestamp (ms) */
+static Value fn_snowflake_timestamp(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_number(0);
+    uint64_t id = (uint64_t)strtoull(argv[0].string.data, NULL, 10);
+    /* Discord epoch: 2015-01-01T00:00:00Z = 1420070400000 ms */
+    uint64_t timestamp_ms = (id >> 22) + 1420070400000ULL;
+    return hajimu_number((double)timestamp_ms);
+}
+
+/* 権限値(権限名) — Discord permission name → bit value */
+static Value fn_permission_value(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_number(0);
+    const char *name = argv[0].string.data;
+    /* Discord Permissions - comprehensive list */
+    static const struct { const char *name; uint64_t value; } perms[] = {
+        {"CREATE_INSTANT_INVITE", 1ULL << 0},
+        {"KICK_MEMBERS",          1ULL << 1},
+        {"BAN_MEMBERS",           1ULL << 2},
+        {"ADMINISTRATOR",         1ULL << 3},
+        {"MANAGE_CHANNELS",       1ULL << 4},
+        {"MANAGE_GUILD",          1ULL << 5},
+        {"ADD_REACTIONS",         1ULL << 6},
+        {"VIEW_AUDIT_LOG",        1ULL << 7},
+        {"PRIORITY_SPEAKER",      1ULL << 8},
+        {"STREAM",                1ULL << 9},
+        {"VIEW_CHANNEL",          1ULL << 10},
+        {"SEND_MESSAGES",         1ULL << 11},
+        {"SEND_TTS_MESSAGES",     1ULL << 12},
+        {"MANAGE_MESSAGES",       1ULL << 13},
+        {"EMBED_LINKS",           1ULL << 14},
+        {"ATTACH_FILES",          1ULL << 15},
+        {"READ_MESSAGE_HISTORY",  1ULL << 16},
+        {"MENTION_EVERYONE",      1ULL << 17},
+        {"USE_EXTERNAL_EMOJIS",   1ULL << 18},
+        {"VIEW_GUILD_INSIGHTS",   1ULL << 19},
+        {"CONNECT",               1ULL << 20},
+        {"SPEAK",                 1ULL << 21},
+        {"MUTE_MEMBERS",          1ULL << 22},
+        {"DEAFEN_MEMBERS",        1ULL << 23},
+        {"MOVE_MEMBERS",          1ULL << 24},
+        {"USE_VAD",               1ULL << 25},
+        {"CHANGE_NICKNAME",       1ULL << 26},
+        {"MANAGE_NICKNAMES",      1ULL << 27},
+        {"MANAGE_ROLES",          1ULL << 28},
+        {"MANAGE_WEBHOOKS",       1ULL << 29},
+        {"MANAGE_EMOJIS_AND_STICKERS", 1ULL << 30},
+        {"USE_APPLICATION_COMMANDS", 1ULL << 31},
+        {"REQUEST_TO_SPEAK",      1ULL << 32},
+        {"MANAGE_EVENTS",         1ULL << 33},
+        {"MANAGE_THREADS",        1ULL << 34},
+        {"CREATE_PUBLIC_THREADS",  1ULL << 35},
+        {"CREATE_PRIVATE_THREADS", 1ULL << 36},
+        {"USE_EXTERNAL_STICKERS", 1ULL << 37},
+        {"SEND_MESSAGES_IN_THREADS", 1ULL << 38},
+        {"USE_EMBEDDED_ACTIVITIES", 1ULL << 39},
+        {"MODERATE_MEMBERS",      1ULL << 40},
+        {"VIEW_CREATOR_MONETIZATION_ANALYTICS", 1ULL << 41},
+        {"USE_SOUNDBOARD",        1ULL << 42},
+        {"USE_EXTERNAL_SOUNDS",   1ULL << 45},
+        {"SEND_VOICE_MESSAGES",   1ULL << 46},
+        {"SEND_POLLS",            1ULL << 49},
+        /* 日本語エイリアス */
+        {"招待作成",              1ULL << 0},
+        {"メンバーキック",        1ULL << 1},
+        {"メンバーBAN",           1ULL << 2},
+        {"管理者",                1ULL << 3},
+        {"チャンネル管理",        1ULL << 4},
+        {"サーバー管理",          1ULL << 5},
+        {"リアクション追加",      1ULL << 6},
+        {"監査ログ表示",          1ULL << 7},
+        {"チャンネル表示",        1ULL << 10},
+        {"メッセージ送信",        1ULL << 11},
+        {"メッセージ管理",        1ULL << 13},
+        {"メッセージ履歴読取",    1ULL << 16},
+        {"全員メンション",        1ULL << 17},
+        {"接続",                  1ULL << 20},
+        {"発言",                  1ULL << 21},
+        {"ミュート",              1ULL << 22},
+        {"スピーカーミュート",    1ULL << 23},
+        {"メンバー移動",          1ULL << 24},
+        {"ニックネーム変更",      1ULL << 26},
+        {"ロール管理",            1ULL << 28},
+        {"Webhook管理",           1ULL << 29},
+        {"スレッド管理",          1ULL << 34},
+        {"モデレート",            1ULL << 40},
+        {NULL, 0}
+    };
+    for (int i = 0; perms[i].name; i++) {
+        if (strcmp(name, perms[i].name) == 0)
+            return hajimu_number((double)perms[i].value);
+    }
+    return hajimu_number(0);
+}
+
+/* 権限チェック(権限値, チェック対象) — ビット演算 */
+static Value fn_permission_check(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_NUMBER || argv[1].type != VALUE_NUMBER)
+        return hajimu_bool(false);
+    uint64_t perms = (uint64_t)argv[0].number;
+    uint64_t check = (uint64_t)argv[1].number;
+    /* ADMINISTRATOR = 0x8 has all permissions */
+    if (perms & (1ULL << 3)) return hajimu_bool(true);
+    return hajimu_bool((perms & check) == check);
+}
+
+/* アプリ情報() — Current application info */
+static Value fn_app_info(int argc, Value *argv) {
+    (void)argc; (void)argv;
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", "/applications/@me", NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* ステッカーパック一覧() — List Sticker Packs (Nitro) */
+static Value fn_sticker_packs(int argc, Value *argv) {
+    (void)argc; (void)argv;
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", "/sticker-packs", NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* チャンネル位置変更(サーバーID, 変更内容JSON配列) */
+static Value fn_channel_position(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING)
+        return hajimu_bool(false);
+    char endpoint[128];
+    snprintf(endpoint, sizeof(endpoint), "/guilds/%s/channels", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("PATCH", endpoint, argv[1].string.data, &code);
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code == 204);
+}
+
+/* ロール位置変更(サーバーID, 変更内容JSON配列) */
+static Value fn_role_position(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING)
+        return hajimu_null();
+    char endpoint[128];
+    snprintf(endpoint, sizeof(endpoint), "/guilds/%s/roles", argv[0].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("PATCH", endpoint, argv[1].string.data, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* リアクションユーザー一覧(チャンネルID, メッセージID, 絵文字 [, 上限]) */
+static Value fn_reaction_users(int argc, Value *argv) {
+    if (argc < 3 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING ||
+        argv[2].type != VALUE_STRING) return hajimu_null();
+    char endpoint[512];
+    int limit = 25;
+    if (argc >= 4 && argv[3].type == VALUE_NUMBER) limit = (int)argv[3].number;
+    snprintf(endpoint, sizeof(endpoint), "/channels/%s/messages/%s/reactions/%s?limit=%d",
+             argv[0].string.data, argv[1].string.data, argv[2].string.data, limit);
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", endpoint, NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* メッセージリアクション全種削除(チャンネルID, メッセージID, 絵文字) — 特定絵文字のリアクションを全削除 */
+static Value fn_remove_emoji_reactions(int argc, Value *argv) {
+    if (argc < 3 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING ||
+        argv[2].type != VALUE_STRING) return hajimu_bool(false);
+    char endpoint[512];
+    snprintf(endpoint, sizeof(endpoint), "/channels/%s/messages/%s/reactions/%s",
+             argv[0].string.data, argv[1].string.data, argv[2].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("DELETE", endpoint, NULL, &code);
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code == 204);
+}
+
+/* スレッドアーカイブ(チャンネルID, アーカイブするか) */
+static Value fn_thread_archive(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING) return hajimu_bool(false);
+    char endpoint[256];
+    snprintf(endpoint, sizeof(endpoint), "/channels/%s", argv[0].string.data);
+    bool archive = true;
+    if (argv[1].type == VALUE_BOOL) archive = argv[1].boolean;
+    else if (argv[1].type == VALUE_NUMBER) archive = (int)argv[1].number != 0;
+    char body[64];
+    snprintf(body, sizeof(body), "{\"archived\":%s}", archive ? "true" : "false");
+    long code = 0;
+    JsonNode *resp = discord_rest("PATCH", endpoint, body, &code);
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code == 200);
+}
+
+/* スレッドロック(チャンネルID, ロックするか) */
+static Value fn_thread_lock(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING) return hajimu_bool(false);
+    char endpoint[256];
+    snprintf(endpoint, sizeof(endpoint), "/channels/%s", argv[0].string.data);
+    bool lock = true;
+    if (argv[1].type == VALUE_BOOL) lock = argv[1].boolean;
+    else if (argv[1].type == VALUE_NUMBER) lock = (int)argv[1].number != 0;
+    char body[64];
+    snprintf(body, sizeof(body), "{\"locked\":%s}", lock ? "true" : "false");
+    long code = 0;
+    JsonNode *resp = discord_rest("PATCH", endpoint, body, &code);
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code == 200);
+}
+
+/* スレッドピン(チャンネルID, ピンするか) */
+static Value fn_thread_pin(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING) return hajimu_bool(false);
+    char endpoint[256];
+    snprintf(endpoint, sizeof(endpoint), "/channels/%s", argv[0].string.data);
+    bool pin = true;
+    if (argv[1].type == VALUE_BOOL) pin = argv[1].boolean;
+    else if (argv[1].type == VALUE_NUMBER) pin = (int)argv[1].number != 0;
+    char body[64];
+    /* flags bit 1 = PINNED */
+    snprintf(body, sizeof(body), "{\"flags\":%d}", pin ? 2 : 0);
+    long code = 0;
+    JsonNode *resp = discord_rest("PATCH", endpoint, body, &code);
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code == 200);
+}
+
+/* コマンド削除(コマンドID [, サーバーID]) — Delete application command */
+static Value fn_command_delete(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) return hajimu_bool(false);
+    char endpoint[256];
+    if (argc >= 2 && argv[1].type == VALUE_STRING) {
+        snprintf(endpoint, sizeof(endpoint), "/applications/%s/guilds/%s/commands/%s",
+                 g_bot.application_id, argv[1].string.data, argv[0].string.data);
+    } else {
+        snprintf(endpoint, sizeof(endpoint), "/applications/%s/commands/%s",
+                 g_bot.application_id, argv[0].string.data);
+    }
+    long code = 0;
+    JsonNode *resp = discord_rest("DELETE", endpoint, NULL, &code);
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code == 204);
+}
+
+/* コマンド一覧([サーバーID]) — List application commands */
+static Value fn_command_list(int argc, Value *argv) {
+    char endpoint[256];
+    if (argc >= 1 && argv[0].type == VALUE_STRING) {
+        snprintf(endpoint, sizeof(endpoint), "/applications/%s/guilds/%s/commands",
+                 g_bot.application_id, argv[0].string.data);
+    } else {
+        snprintf(endpoint, sizeof(endpoint), "/applications/%s/commands", g_bot.application_id);
+    }
+    long code = 0;
+    JsonNode *resp = discord_rest("GET", endpoint, NULL, &code);
+    Value result = hajimu_null();
+    if (resp && code == 200) result = json_to_value(resp);
+    if (resp) { json_free(resp); free(resp); }
+    return result;
+}
+
+/* コマンド権限設定(サーバーID, コマンドID, 権限配列JSON) */
+static Value fn_command_permissions(int argc, Value *argv) {
+    if (argc < 3 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING ||
+        argv[2].type != VALUE_STRING) return hajimu_bool(false);
+    char endpoint[256];
+    snprintf(endpoint, sizeof(endpoint),
+             "/applications/%s/guilds/%s/commands/%s/permissions",
+             g_bot.application_id, argv[0].string.data, argv[1].string.data);
+    long code = 0;
+    JsonNode *resp = discord_rest("PUT", endpoint, argv[2].string.data, &code);
+    if (resp) { json_free(resp); free(resp); }
+    return hajimu_bool(code == 200);
+}
+
+/* Webhook編集メッセージ(WebhookID, トークン, MessageID, 内容) */
+static Value fn_webhook_edit_message(int argc, Value *argv) {
+    if (argc < 4 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING ||
+        argv[2].type != VALUE_STRING || argv[3].type != VALUE_STRING)
+        return hajimu_null();
+    char url[512];
+    snprintf(url, sizeof(url), "%s/webhooks/%s/%s/messages/%s",
+             DISCORD_API_BASE, argv[0].string.data, argv[1].string.data, argv[2].string.data);
+    /* Use direct curl since this doesn't use bot auth */
+    CURL *curl = curl_easy_init();
+    if (!curl) return hajimu_null();
+    CurlBuf resp = {(char *)calloc(1, REST_BUF_INIT), 0};
+    if (!resp.data) { curl_easy_cleanup(curl); return hajimu_null(); }
+    struct curl_slist *hdrs = NULL;
+    hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PATCH");
+    curl_easy_setopt(curl, CURLOPT_POSTFIELDS, argv[3].string.data);
+    curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_perform(curl);
+    long code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    curl_slist_free_all(hdrs);
+    curl_easy_cleanup(curl);
+    Value result = hajimu_null();
+    if (code == 200 && resp.data) {
+        JsonNode *j = json_parse(resp.data);
+        if (j) { result = json_to_value(j); json_free(j); free(j); }
+    }
+    free(resp.data);
+    return result;
+}
+
+/* Webhook削除メッセージ(WebhookID, トークン, MessageID) */
+static Value fn_webhook_delete_message(int argc, Value *argv) {
+    if (argc < 3 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING ||
+        argv[2].type != VALUE_STRING) return hajimu_bool(false);
+    char url[512];
+    snprintf(url, sizeof(url), "%s/webhooks/%s/%s/messages/%s",
+             DISCORD_API_BASE, argv[0].string.data, argv[1].string.data, argv[2].string.data);
+    CURL *curl = curl_easy_init();
+    if (!curl) return hajimu_bool(false);
+    curl_easy_setopt(curl, CURLOPT_URL, url);
+    curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_perform(curl);
+    long code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    curl_easy_cleanup(curl);
+    return hajimu_bool(code == 204);
+}
+
+/* =========================================================================
  * Section 15: Plugin Registration
  * ========================================================================= */
 
@@ -8183,6 +8970,69 @@ static HajimuPluginFunc functions[] = {
     {"ログレベル設定",       fn_set_log_level,     1,  1},
     {"インテント値",         fn_intent_value,      1,  1},
     {"バージョン",           fn_version,           0,  0},
+
+    /* ===== v2.3.0: 互換性強化 ===== */
+
+    /* 自動選択メニュー (Auto-populated Select Menus) */
+    {"ユーザーセレクト作成",     fn_user_select_create,        1,  2},
+    {"ロールセレクト作成",       fn_role_select_create,        1,  2},
+    {"チャンネルセレクト作成",   fn_channel_select_create,     1,  2},
+    {"メンション可能セレクト作成", fn_mentionable_select_create, 1, 2},
+
+    /* BAN管理拡張 */
+    {"BAN一覧",                 fn_ban_list,                  1,  2},
+    {"BAN一括",                 fn_bulk_ban,                  2,  3},
+
+    /* メンバー管理拡張 */
+    {"メンバー編集",             fn_member_edit,               3,  3},
+    {"ニックネーム変更",         fn_nick_change,               2,  2},
+
+    /* Webhook拡張 */
+    {"Webhook編集",             fn_webhook_edit,              2,  2},
+    {"Webhook情報",             fn_webhook_info,              1,  1},
+    {"Webhookメッセージ編集",   fn_webhook_edit_message,      4,  4},
+    {"Webhookメッセージ削除",   fn_webhook_delete_message,    3,  3},
+
+    /* スレッド管理拡張 */
+    {"アクティブスレッド一覧",   fn_active_threads,            1,  1},
+    {"アーカイブスレッド一覧",   fn_archived_threads,          1,  2},
+    {"スレッドアーカイブ",       fn_thread_archive,            2,  2},
+    {"スレッドロック",           fn_thread_lock,               2,  2},
+    {"スレッドピン",             fn_thread_pin,                2,  2},
+
+    /* アナウンスチャンネル */
+    {"クロスポスト",             fn_crosspost,                 2,  2},
+    {"チャンネルフォロー",       fn_channel_follow,            2,  2},
+
+    /* サーバー管理拡張 */
+    {"プルーン確認",             fn_prune_count,               1,  2},
+    {"プルーン実行",             fn_prune,                     1,  2},
+    {"サーバー削除",             fn_guild_delete,              1,  1},
+    {"サーバープレビュー",       fn_guild_preview,             1,  1},
+    {"ウィジェット設定取得",     fn_widget_settings_get,       1,  1},
+    {"ウィジェット設定更新",     fn_widget_settings_edit,      2,  2},
+    {"バニティURL取得",         fn_vanity_url,                1,  1},
+
+    /* チャンネル・ロール並べ替え */
+    {"チャンネル位置変更",       fn_channel_position,          2,  2},
+    {"ロール位置変更",           fn_role_position,             2,  2},
+
+    /* リアクション拡張 */
+    {"リアクションユーザー一覧", fn_reaction_users,            3,  4},
+    {"絵文字リアクション削除",   fn_remove_emoji_reactions,    3,  3},
+
+    /* コマンド管理 */
+    {"コマンド削除",             fn_command_delete,            1,  2},
+    {"コマンド一覧",             fn_command_list,              0,  1},
+    {"コマンド権限設定",         fn_command_permissions,       3,  3},
+
+    /* ユーティリティ */
+    {"Snowflakeタイムスタンプ",  fn_snowflake_timestamp,       1,  1},
+    {"権限値",                   fn_permission_value,          1,  1},
+    {"権限チェック",             fn_permission_check,          2,  2},
+    {"アプリ情報",               fn_app_info,                  0,  0},
+    {"Voice地域一覧",            fn_voice_regions,             0,  0},
+    {"ステッカーパック一覧",     fn_sticker_packs,             0,  0},
 };
 
 HAJIMU_PLUGIN_EXPORT HajimuPluginInfo *hajimu_plugin_init(void) {

@@ -21,6 +21,9 @@
  * v2.0.0 — 2026-02-14  ボイスチャンネル対応 (Opus/Sodium)
  * v2.1.0 — 2026-02-14  ステージチャンネル・スタンプ・サーバー編集・Markdownユーティリティ
  * v2.2.0 — 2026-02-14  Components V2・テンプレート・オンボーディング・サウンドボード・OAuth2・シャーディング
+ * v2.2.1 — 2026-02-15  セキュリティ・バグ修正 (JSONパーサ境界チェック, User-Agent統一,
+ *                       OAuth2メモリ安全性, pthread UB修正, 音声停止ロジック修正,
+ *                       ffmpegコマンドインジェクション防止, シャード検証追加)
  */
 
 #define _GNU_SOURCE
@@ -62,7 +65,10 @@
  * ========================================================================= */
 
 #define PLUGIN_NAME    "hajimu_discord"
-#define PLUGIN_VERSION "2.2.0"
+#define PLUGIN_VERSION "2.2.1"
+
+/* User-Agent (version auto-embedded) */
+#define DISCORD_USER_AGENT "User-Agent: DiscordBot (hajimu_discord, " PLUGIN_VERSION ")"
 
 /* Discord API */
 #define DISCORD_API_BASE    "https://discord.com/api/v10"
@@ -765,13 +771,13 @@ static JsonNode jp_parse_value(JParser *p, int depth) {
     if (c == '{') return jp_parse_object(p, depth);
     if (c == '[') return jp_parse_array(p, depth);
     if (c == '-' || (c >= '0' && c <= '9')) return jp_parse_number(p);
-    if (strncmp(p->s + p->pos, "true", 4) == 0) {
+    if (p->pos + 4 <= p->len && strncmp(p->s + p->pos, "true", 4) == 0) {
         p->pos += 4; JsonNode n = json_null_node(); n.type = JSON_BOOL; n.boolean = true; return n;
     }
-    if (strncmp(p->s + p->pos, "false", 5) == 0) {
+    if (p->pos + 5 <= p->len && strncmp(p->s + p->pos, "false", 5) == 0) {
         p->pos += 5; JsonNode n = json_null_node(); n.type = JSON_BOOL; n.boolean = false; return n;
     }
-    if (strncmp(p->s + p->pos, "null", 4) == 0) {
+    if (p->pos + 4 <= p->len && strncmp(p->s + p->pos, "null", 4) == 0) {
         p->pos += 4; return json_null_node();
     }
     return json_null_node();
@@ -966,7 +972,7 @@ static JsonNode *discord_rest(const char *method, const char *endpoint,
     snprintf(auth, sizeof(auth), "Authorization: Bot %s", g_bot.token);
     hdrs = curl_slist_append(hdrs, auth);
     hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
-    hdrs = curl_slist_append(hdrs, "User-Agent: DiscordBot (hajimu_discord, 1.0.0)");
+    hdrs = curl_slist_append(hdrs, DISCORD_USER_AGENT);
 
     curl_easy_reset(curl);
     curl_easy_setopt(curl, CURLOPT_URL, url);
@@ -1012,11 +1018,15 @@ static JsonNode *discord_rest(const char *method, const char *endpoint,
             free(resp.data);
             /* Retry once */
             resp.data = (char *)calloc(1, REST_BUF_INIT);
+            if (!resp.data) {
+                pthread_mutex_unlock(&g_bot.rest_mutex);
+                return NULL;
+            }
             resp.len = 0;
             hdrs = NULL;
             hdrs = curl_slist_append(hdrs, auth);
             hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
-            hdrs = curl_slist_append(hdrs, "User-Agent: DiscordBot (hajimu_discord, 1.0.0)");
+            hdrs = curl_slist_append(hdrs, DISCORD_USER_AGENT);
             curl_easy_reset(curl);
             curl_easy_setopt(curl, CURLOPT_URL, url);
             curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
@@ -2827,7 +2837,6 @@ static void voice_check_ready(VoiceConn *vc) {
     LOG_I("Voice両イベント受信完了。Voice WSに接続開始...");
     /* Start voice WebSocket thread */
     pthread_create(&vc->voice_ws_thread, NULL, voice_ws_thread_func, vc);
-    pthread_detach(vc->voice_ws_thread);
 }
 
 /* --- Audio Playback Thread --- */
@@ -2845,6 +2854,23 @@ static bool wav_read_header(FILE *fp, int *channels, int *sample_rate, int *bits
     *sample_rate = hdr[24] | (hdr[25] << 8) | (hdr[26] << 16) | (hdr[27] << 24);
     *bits_per_sample = hdr[34] | (hdr[35] << 8);
 
+    return true;
+}
+
+/* Validate filepath for safe shell use (reject shell metacharacters) */
+static bool voice_filepath_safe(const char *path) {
+    /* Reject empty paths */
+    if (!path || !*path) return false;
+    /* Reject characters that could cause shell injection in popen */
+    for (const char *p = path; *p; p++) {
+        switch (*p) {
+            case '`': case '$': case '\\': case '"': case '\'':
+            case ';': case '|': case '&': case '<': case '>':
+            case '(': case ')': case '{': case '}':
+            case '\n': case '\r':
+                return false;
+        }
+    }
     return true;
 }
 
@@ -2905,6 +2931,12 @@ static void *voice_audio_thread_func(void *arg) {
         }
 
         if (use_ffmpeg) {
+            /* Validate filepath to prevent shell injection via popen */
+            if (!voice_filepath_safe(filepath)) {
+                LOG_E("音声ファイルパスに不正な文字が含まれています: %s", filepath);
+                vc->playing = false;
+                continue;
+            }
             /* Use ffmpeg to convert any audio to 48kHz 16bit stereo PCM */
             char cmd[1024];
             snprintf(cmd, sizeof(cmd),
@@ -4073,12 +4105,16 @@ static JsonNode *discord_rest_multipart(const char *endpoint,
 
     CurlBuf resp = {NULL, 0};
     resp.data = (char *)calloc(1, REST_BUF_INIT);
+    if (!resp.data) {
+        pthread_mutex_unlock(&g_bot.rest_mutex);
+        return NULL;
+    }
 
     struct curl_slist *hdrs = NULL;
     char auth[MAX_TOKEN_LEN + 32];
     snprintf(auth, sizeof(auth), "Authorization: Bot %s", g_bot.token);
     hdrs = curl_slist_append(hdrs, auth);
-    hdrs = curl_slist_append(hdrs, "User-Agent: DiscordBot (hajimu_discord, 1.0.0)");
+    hdrs = curl_slist_append(hdrs, DISCORD_USER_AGENT);
 
     curl_mime *mime = curl_mime_init(curl);
 
@@ -4134,7 +4170,7 @@ static JsonNode *webhook_rest(const char *full_url, const char *body, long *http
 
     struct curl_slist *hdrs = NULL;
     hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
-    hdrs = curl_slist_append(hdrs, "User-Agent: DiscordBot (hajimu_discord, 1.0.0)");
+    hdrs = curl_slist_append(hdrs, DISCORD_USER_AGENT);
 
     curl_easy_setopt(curl, CURLOPT_URL, full_url);
     curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
@@ -6266,7 +6302,6 @@ static Value fn_vc_join(int argc, Value *argv) {
 
     /* Start audio thread */
     pthread_create(&vc->audio_thread, NULL, voice_audio_thread_func, vc);
-    pthread_detach(vc->audio_thread);
 
     /* Send Gateway op 4 to join voice channel */
     gw_send_voice_state(guild_id, channel_id);
@@ -6347,7 +6382,9 @@ static Value fn_voice_stop(int argc, Value *argv) {
 
     pthread_mutex_lock(&vc->voice_mutex);
     vc->playing = false;
-    vc->stop_requested = true;
+    vc->paused = false;
+    /* Don't set stop_requested=true: that kills the audio thread entirely.
+       Just stop current playback and clear queue so nothing else plays. */
     /* Clear queue */
     vc->queue_head = 0;
     vc->queue_tail = 0;
@@ -7679,7 +7716,8 @@ static Value fn_oauth2_token_refresh(int argc, Value *argv) {
              "grant_type=refresh_token&refresh_token=%s", argv[2].string.data);
 
     char url[] = "https://discord.com/api/v10/oauth2/token";
-    CurlBuf resp_buf = {(char *)calloc(1, 4096), 0};
+    CurlBuf resp_buf = {(char *)calloc(1, REST_BUF_INIT), 0};
+    if (!resp_buf.data) { curl_easy_cleanup(curl); return hajimu_null(); }
 
     struct curl_slist *hdrs = NULL;
     hdrs = curl_slist_append(hdrs, "Content-Type: application/x-www-form-urlencoded");
@@ -7723,7 +7761,8 @@ static Value fn_oauth2_token_revoke(int argc, Value *argv) {
     snprintf(post_data, sizeof(post_data), "token=%s", argv[2].string.data);
 
     char url[] = "https://discord.com/api/v10/oauth2/token/revoke";
-    CurlBuf resp_buf = {(char *)calloc(1, 1024), 0};
+    CurlBuf resp_buf = {(char *)calloc(1, REST_BUF_INIT), 0};
+    if (!resp_buf.data) { curl_easy_cleanup(curl); return hajimu_bool(false); }
 
     struct curl_slist *hdrs = NULL;
     hdrs = curl_slist_append(hdrs, "Content-Type: application/x-www-form-urlencoded");
@@ -7803,6 +7842,14 @@ static Value fn_shard_set(int argc, Value *argv) {
     }
     g_bot.shard_id = (int)argv[0].number;
     g_bot.shard_count = (int)argv[1].number;
+    if (g_bot.shard_id < 0 || g_bot.shard_count <= 0 || g_bot.shard_id >= g_bot.shard_count) {
+        LOG_E("シャード設定: 無効な値です (shard_id=%d, shard_count=%d). "
+              "shard_id >= 0 かつ shard_id < shard_count が必要です",
+              g_bot.shard_id, g_bot.shard_count);
+        g_bot.shard_id = 0;
+        g_bot.shard_count = 1;
+        return hajimu_bool(false);
+    }
     g_bot.sharding_enabled = true;
     LOG_I("シャード設定: shard_id=%d, shard_count=%d",
           g_bot.shard_id, g_bot.shard_count);

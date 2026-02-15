@@ -3250,13 +3250,13 @@ static void *voice_audio_thread_func(void *arg) {
                 LOG_I("yt-dlp経由で再生: %s", filepath);
                 snprintf(cmd, sizeof(cmd),
                     "yt-dlp -o - -f bestaudio --no-playlist --no-warnings %s \"%s\" 2>/tmp/hajimu_ytdlp_err.log | "
-                    "ffmpeg -i pipe:0 -f s16le -ar %d -ac %d -loglevel error -",
+                    "ffmpeg -i pipe:0 -f s16le -ar %d -ac %d -loglevel quiet -",
                     g_bot.ytdlp_cookie_opt[0] ? g_bot.ytdlp_cookie_opt : "",
                     filepath, VOICE_SAMPLE_RATE, VOICE_CHANNELS);
             } else {
                 /* Local file or direct URL: ffmpeg only */
                 snprintf(cmd, sizeof(cmd),
-                    "ffmpeg -i \"%s\" -f s16le -ar %d -ac %d -loglevel error -",
+                    "ffmpeg -i \"%s\" -f s16le -ar %d -ac %d -loglevel quiet -",
                     filepath, VOICE_SAMPLE_RATE, VOICE_CHANNELS);
             }
             fp = popen(cmd, "r");

@@ -125,6 +125,7 @@
 #define VOICE_FRAME_SIZE      (VOICE_FRAME_SAMPLES * VOICE_CHANNELS)       /* 1920 */
 #define VOICE_MAX_PACKET      4000
 #define MAX_AUDIO_QUEUE       64
+#define MAX_VOICE_STATE_CACHE 512
 
 /* Discord component types */
 #define COMP_ACTION_ROW       1
@@ -488,10 +489,21 @@ typedef struct {
     VoiceConn voice_conns[MAX_VOICE_CONNS];
     int voice_conn_count;
 
+    /* Voice state cache — maps (guild_id, user_id) → channel_id */
+    struct {
+        char guild_id[MAX_SNOWFLAKE];
+        char user_id[MAX_SNOWFLAKE];
+        char channel_id[MAX_SNOWFLAKE];
+    } voice_states[MAX_VOICE_STATE_CACHE];
+    int voice_state_count;
+
     /* Sharding (v2.2.0) */
     int shard_id;
     int shard_count;
     bool sharding_enabled;
+
+    /* yt-dlp cookie option (v2.5.0) */
+    char ytdlp_cookie_opt[512];
 } BotState;
 
 static BotState g_bot = {0};
@@ -1644,6 +1656,55 @@ static Value json_to_value(JsonNode *node) {
     return hajimu_null();
 }
 
+/* Voice state cache helpers */
+static void voice_state_cache_update(const char *guild_id, const char *user_id, const char *channel_id) {
+    for (int i = 0; i < g_bot.voice_state_count; i++) {
+        if (strcmp(g_bot.voice_states[i].guild_id, guild_id) == 0 &&
+            strcmp(g_bot.voice_states[i].user_id, user_id) == 0) {
+            if (channel_id && *channel_id) {
+                snprintf(g_bot.voice_states[i].channel_id, MAX_SNOWFLAKE, "%s", channel_id);
+            } else {
+                g_bot.voice_states[i] = g_bot.voice_states[--g_bot.voice_state_count];
+            }
+            return;
+        }
+    }
+    if (channel_id && *channel_id && g_bot.voice_state_count < MAX_VOICE_STATE_CACHE) {
+        int idx = g_bot.voice_state_count++;
+        snprintf(g_bot.voice_states[idx].guild_id, MAX_SNOWFLAKE, "%s", guild_id);
+        snprintf(g_bot.voice_states[idx].user_id, MAX_SNOWFLAKE, "%s", user_id);
+        snprintf(g_bot.voice_states[idx].channel_id, MAX_SNOWFLAKE, "%s", channel_id);
+    }
+}
+
+static const char *voice_state_cache_get(const char *guild_id, const char *user_id) {
+    if (!guild_id || !user_id) return NULL;
+    for (int i = 0; i < g_bot.voice_state_count; i++) {
+        if (strcmp(g_bot.voice_states[i].guild_id, guild_id) == 0 &&
+            strcmp(g_bot.voice_states[i].user_id, user_id) == 0) {
+            return g_bot.voice_states[i].channel_id;
+        }
+    }
+    return NULL;
+}
+
+/* Helper to add a key-value pair to an existing Value dict */
+static void value_dict_add(Value *dict, const char *key, Value v) {
+    if (!dict || dict->type != VALUE_DICT) return;
+    if (dict->dict.length >= dict->dict.capacity) {
+        int new_cap = dict->dict.capacity ? dict->dict.capacity * 2 : 4;
+        char **new_keys = (char **)realloc(dict->dict.keys, new_cap * sizeof(char *));
+        Value *new_vals = (Value *)realloc(dict->dict.values, new_cap * sizeof(Value));
+        if (!new_keys || !new_vals) return;
+        dict->dict.keys = new_keys;
+        dict->dict.values = new_vals;
+        dict->dict.capacity = new_cap;
+    }
+    dict->dict.keys[dict->dict.length] = strdup(key);
+    dict->dict.values[dict->dict.length] = v;
+    dict->dict.length++;
+}
+
 /* Extract snowflake (ID) string from a Value (accepts string or nested dict) */
 static const char *value_get_str(Value *v, const char *key) {
     if (!v || v->type != VALUE_DICT) return NULL;
@@ -1866,14 +1927,32 @@ static void gw_handle_interaction(JsonNode *data) {
         /* Find registered command */
         for (int i = 0; i < g_bot.command_count; i++) {
             if (strcmp(g_bot.commands[i].name, cmd_name) == 0) {
+                LOG_I("CMD: '%s' コマンド一致 (idx=%d)", cmd_name, i);
                 /* Build interaction value for the callback */
                 Value interaction = json_to_value(data);
+
+                /* Inject ボイスチャンネルID from voice state cache */
+                {
+                    const char *gid = json_get_str(data, "guild_id");
+                    JsonNode *member = json_get(data, "member");
+                    JsonNode *user = member ? json_get(member, "user") : NULL;
+                    const char *uid = user ? json_get_str(user, "id") : NULL;
+                    if (gid && uid) {
+                        const char *vc_id = voice_state_cache_get(gid, uid);
+                        if (vc_id) {
+                            value_dict_add(&interaction, "ボイスチャンネルID", hajimu_string(vc_id));
+                        }
+                    }
+                }
+
                 event_fire("INTERACTION_CREATE", 1, &interaction);
 
                 /* Call specific command handler */
                 pthread_mutex_lock(&g_bot.callback_mutex);
                 if (hajimu_runtime_available()) {
+                    LOG_I("CMD: '%s' コールバック開始", cmd_name);
                     hajimu_call(&g_bot.commands[i].callback, 1, &interaction);
+                    LOG_I("CMD: '%s' コールバック完了", cmd_name);
                 }
                 pthread_mutex_unlock(&g_bot.callback_mutex);
                 return;
@@ -2003,6 +2082,18 @@ static void gw_handle_dispatch(const char *event_name, JsonNode *data) {
 
     /* Fire Japanese event aliases */
     if (strcmp(event_name, "MESSAGE_CREATE") == 0) {
+        /* Inject ボイスチャンネルID from voice state cache */
+        {
+            const char *gid = json_get_str(data, "guild_id");
+            JsonNode *author = json_get(data, "author");
+            const char *uid = author ? json_get_str(author, "id") : NULL;
+            if (gid && uid) {
+                const char *vc_id = voice_state_cache_get(gid, uid);
+                if (vc_id) {
+                    value_dict_add(&val, "ボイスチャンネルID", hajimu_string(vc_id));
+                }
+            }
+        }
         event_fire("メッセージ受信", 1, &val);
         /* v1.6.0: Feed message collectors */
         JsonNode *ch = json_get(data, "channel_id");
@@ -2024,6 +2115,20 @@ static void gw_handle_dispatch(const char *event_name, JsonNode *data) {
         event_fire("リアクション削除", 1, &val);
     } else if (strcmp(event_name, "GUILD_CREATE") == 0) {
         event_fire("サーバー参加", 1, &val);
+        /* Populate voice state cache from guild data */
+        {
+            const char *gid = json_get_str(data, "id");
+            JsonNode *vs = json_get(data, "voice_states");
+            if (gid && vs && vs->type == JSON_ARRAY) {
+                for (int vi = 0; vi < vs->arr.count; vi++) {
+                    const char *uid = json_get_str(&vs->arr.items[vi], "user_id");
+                    const char *cid = json_get_str(&vs->arr.items[vi], "channel_id");
+                    if (uid) {
+                        voice_state_cache_update(gid, uid, cid);
+                    }
+                }
+            }
+        }
     } else if (strcmp(event_name, "GUILD_DELETE") == 0) {
         event_fire("サーバー退出", 1, &val);
     } else if (strcmp(event_name, "CHANNEL_CREATE") == 0) {
@@ -2040,6 +2145,15 @@ static void gw_handle_dispatch(const char *event_name, JsonNode *data) {
         event_fire("プレゼンス更新", 1, &val);
     } else if (strcmp(event_name, "VOICE_STATE_UPDATE") == 0) {
         event_fire("ボイス状態更新", 1, &val);
+        /* Cache voice states for all users */
+        {
+            const char *uid = json_get_str(data, "user_id");
+            const char *gid = json_get_str(data, "guild_id");
+            const char *cid = json_get_str(data, "channel_id");
+            if (uid && gid) {
+                voice_state_cache_update(gid, uid, cid);
+            }
+        }
         /* v2.0.0: Capture session_id for our voice connections */
         {
             const char *uid = json_get_str(data, "user_id");
@@ -2981,7 +3095,9 @@ static bool is_youtube_url(const char *url) {
 static char *ytdlp_exec(const char *args, const char *url) {
     if (!voice_filepath_safe(url)) return NULL;
     char cmd[2048];
-    snprintf(cmd, sizeof(cmd), "yt-dlp %s \"%s\" 2>/dev/null", args, url);
+    snprintf(cmd, sizeof(cmd), "yt-dlp %s %s \"%s\" 2>/dev/null",
+             g_bot.ytdlp_cookie_opt[0] ? g_bot.ytdlp_cookie_opt : "",
+             args, url);
     FILE *pp = popen(cmd, "r");
     if (!pp) return NULL;
 
@@ -3072,8 +3188,9 @@ static void *voice_audio_thread_func(void *arg) {
                 /* YouTube/streaming: yt-dlp → ffmpeg pipe */
                 LOG_I("yt-dlp経由で再生: %s", filepath);
                 snprintf(cmd, sizeof(cmd),
-                    "yt-dlp -o - -f bestaudio --no-playlist --no-warnings \"%s\" 2>/dev/null | "
+                    "yt-dlp -o - -f bestaudio --no-playlist --no-warnings %s \"%s\" 2>/dev/null | "
                     "ffmpeg -i pipe:0 -f s16le -ar %d -ac %d -loglevel error -",
+                    g_bot.ytdlp_cookie_opt[0] ? g_bot.ytdlp_cookie_opt : "",
                     filepath, VOICE_SAMPLE_RATE, VOICE_CHANNELS);
             } else {
                 /* Local file or direct URL: ffmpeg only */
@@ -3318,6 +3435,23 @@ static Value fn_bot_create(int argc, Value *argv) {
     if (client_id_env && client_id_env[0]) {
         snprintf(g_bot.application_id, sizeof(g_bot.application_id), "%s", client_id_env);
         LOG_I("CLIENT_ID を環境変数から設定: %s", g_bot.application_id);
+    }
+
+    /* YOUTUBE_COOKIES_BROWSER 環境変数からyt-dlpのcookieオプションを自動設定 */
+    const char *cookies_browser = getenv("YOUTUBE_COOKIES_BROWSER");
+    if (cookies_browser && cookies_browser[0]) {
+        snprintf(g_bot.ytdlp_cookie_opt, sizeof(g_bot.ytdlp_cookie_opt),
+                 "--cookies-from-browser %s", cookies_browser);
+        LOG_I("yt-dlp Cookie設定 (環境変数): --cookies-from-browser %s", cookies_browser);
+    } else {
+        /* cookies.txt がカレントディレクトリに存在すれば自動使用 */
+        FILE *cf = fopen("cookies.txt", "r");
+        if (cf) {
+            fclose(cf);
+            snprintf(g_bot.ytdlp_cookie_opt, sizeof(g_bot.ytdlp_cookie_opt),
+                     "--cookies cookies.txt");
+            LOG_I("yt-dlp Cookie設定 (自動検出): --cookies cookies.txt");
+        }
     }
 
     LOG_I("ボット初期化完了");
@@ -3830,7 +3964,9 @@ static Value fn_command_respond(int argc, Value *argv) {
     const char *interaction_id = value_get_str(&argv[0], "ID");
     const char *interaction_token = value_get_str(&argv[0], "トークン");
     if (!interaction_id || !interaction_token) {
-        LOG_E("コマンド応答: インタラクションにIDまたはトークンがありません");
+        LOG_E("コマンド応答: インタラクションにIDまたはトークンがありません id=%s tok=%s",
+              interaction_id ? interaction_id : "NULL",
+              interaction_token ? "(present)" : "NULL");
         return hajimu_bool(false);
     }
 
@@ -3845,12 +3981,15 @@ static Value fn_command_respond(int argc, Value *argv) {
     jb_obj_end(&sb); sb_append_char(&sb, ',');
     jb_obj_end(&sb);
 
-    char ep[256];
+    char ep[512];
     snprintf(ep, sizeof(ep), "/interactions/%s/%s/callback",
              interaction_id, interaction_token);
 
+    LOG_I("コマンド応答: POST %s (ep_len=%zu, body_len=%zu)", ep, strlen(ep), strlen(sb.data));
+
     long code = 0;
     JsonNode *resp = discord_rest("POST", ep, sb.data, &code);
+    LOG_I("コマンド応答: HTTP %ld", code);
     sb_free(&sb);
     if (resp) { json_free(resp); free(resp); }
     return hajimu_bool(code == 200 || code == 204);
@@ -3858,17 +3997,28 @@ static Value fn_command_respond(int argc, Value *argv) {
 
 /* コマンド遅延応答(インタラクション) */
 static Value fn_command_defer(int argc, Value *argv) {
-    if (argc < 1 || argv[0].type != VALUE_DICT) return hajimu_bool(false);
+    LOG_I("DEFER: 呼び出し argc=%d type=%d", argc, argc > 0 ? argv[0].type : -1);
+    if (argc < 1 || argv[0].type != VALUE_DICT) {
+        LOG_E("DEFER: 引数エラー");
+        return hajimu_bool(false);
+    }
     const char *interaction_id = value_get_str(&argv[0], "ID");
     const char *interaction_token = value_get_str(&argv[0], "トークン");
-    if (!interaction_id || !interaction_token) return hajimu_bool(false);
+    LOG_I("DEFER: id=%s tok=%s", interaction_id ? interaction_id : "NULL",
+          interaction_token ? "(present)" : "NULL");
+    if (!interaction_id || !interaction_token) {
+        LOG_E("DEFER: IDまたはトークンがNULL");
+        return hajimu_bool(false);
+    }
 
-    char ep[256];
+    char ep[512];
     snprintf(ep, sizeof(ep), "/interactions/%s/%s/callback",
              interaction_id, interaction_token);
+    LOG_I("DEFER: POST %s (len=%zu)", ep, strlen(ep));
 
     long code = 0;
     JsonNode *resp = discord_rest("POST", ep, "{\"type\":5}", &code);
+    LOG_I("DEFER: HTTP %ld", code);
     if (resp) { json_free(resp); free(resp); }
     return hajimu_bool(code == 200 || code == 204);
 }
@@ -3885,7 +4035,7 @@ static Value fn_command_followup(int argc, Value *argv) {
     jb_str(&sb, "content", argv[1].string.data);
     jb_obj_end(&sb);
 
-    char ep[256];
+    char ep[512];
     snprintf(ep, sizeof(ep), "/webhooks/%s/%s", g_bot.application_id, interaction_token);
 
     long code = 0;
@@ -5295,7 +5445,7 @@ static Value fn_interaction_update(int argc, Value *argv) {
     jb_obj_end(&sb); sb_append_char(&sb, ',');
     jb_obj_end(&sb);
 
-    char ep[256];
+    char ep[512];
     snprintf(ep, sizeof(ep), "/interactions/%s/%s/callback",
              interaction_id, interaction_token);
 
@@ -5313,7 +5463,7 @@ static Value fn_interaction_defer_update(int argc, Value *argv) {
     const char *interaction_token = value_get_str(&argv[0], "トークン");
     if (!interaction_id || !interaction_token) return hajimu_bool(false);
 
-    char ep[256];
+    char ep[512];
     snprintf(ep, sizeof(ep), "/interactions/%s/%s/callback",
              interaction_id, interaction_token);
 
@@ -5436,7 +5586,7 @@ static Value fn_modal_show(int argc, Value *argv) {
     jb_obj_end(&sb); sb_append_char(&sb, ',');
     jb_obj_end(&sb);
 
-    char ep[256];
+    char ep[512];
     snprintf(ep, sizeof(ep), "/interactions/%s/%s/callback",
              interaction_id, interaction_token);
 
@@ -5575,7 +5725,7 @@ static Value fn_autocomplete_respond(int argc, Value *argv) {
     jb_obj_end(&sb); sb_append_char(&sb, ',');
     jb_obj_end(&sb);
 
-    char ep[256];
+    char ep[512];
     snprintf(ep, sizeof(ep), "/interactions/%s/%s/callback",
              interaction_id, interaction_token);
 
@@ -6421,6 +6571,16 @@ static Value fn_poll_end(int argc, Value *argv) {
  * v2.0.0: ボイスチャンネル対応
  * ========================================================================= */
 
+/* ユーザーボイスチャンネル(サーバーID, ユーザーID) — Get user's current voice channel */
+static Value fn_get_user_voice_channel(int argc, Value *argv) {
+    if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING) {
+        return hajimu_null();
+    }
+    const char *vc = voice_state_cache_get(argv[0].string.data, argv[1].string.data);
+    if (vc) return hajimu_string(vc);
+    return hajimu_null();
+}
+
 /* VC接続(サーバーID, チャンネルID) — Join a voice channel */
 static Value fn_vc_join(int argc, Value *argv) {
     if (argc < 2 || argv[0].type != VALUE_STRING || argv[1].type != VALUE_STRING) {
@@ -6692,7 +6852,8 @@ static Value fn_ytdlp_info(int argc, Value *argv) {
     /* Get JSON info from yt-dlp */
     char cmd[2048];
     snprintf(cmd, sizeof(cmd),
-        "yt-dlp --no-playlist --no-warnings -j \"%s\" 2>/dev/null", url);
+        "yt-dlp --no-playlist --no-warnings %s -j \"%s\" 2>/dev/null",
+        g_bot.ytdlp_cookie_opt[0] ? g_bot.ytdlp_cookie_opt : "", url);
     FILE *pp = popen(cmd, "r");
     if (!pp) {
         LOG_E("YouTube情報: yt-dlp起動失敗");
@@ -6814,9 +6975,10 @@ static Value fn_ytdlp_search(int argc, Value *argv) {
     /* yt-dlp ytsearch: returns JSON for each result */
     char cmd[2048];
     snprintf(cmd, sizeof(cmd),
-        "yt-dlp --no-playlist --no-warnings --flat-playlist "
+        "yt-dlp --no-playlist --no-warnings --flat-playlist %s "
         "--print \"{\\\"タイトル\\\": \\\"%%(title)s\\\", \\\"URL\\\": \\\"https://www.youtube.com/watch?v=%%(id)s\\\", \\\"ID\\\": \\\"%%(id)s\\\", \\\"投稿者\\\": \\\"%%(uploader)s\\\", \\\"再生時間\\\": %%(duration)s}\" "
         "\"ytsearch%d:%s\" 2>/dev/null",
+        g_bot.ytdlp_cookie_opt[0] ? g_bot.ytdlp_cookie_opt : "",
         count, query);
     FILE *pp = popen(cmd, "r");
     if (!pp) {
@@ -6848,6 +7010,34 @@ static Value fn_ytdlp_search(int argc, Value *argv) {
         return arr.array.elements[0];
     }
     return arr;
+}
+
+/* YouTubeクッキー設定(ブラウザ名またはファイルパス) */
+static Value fn_ytdlp_set_cookies(int argc, Value *argv) {
+    if (argc < 1 || argv[0].type != VALUE_STRING) {
+        LOG_E("YouTubeクッキー設定: 文字列が必要です (ブラウザ名 or ファイルパス)");
+        return hajimu_bool(false);
+    }
+    const char *val = argv[0].string.data;
+
+    /* ブラウザ名判定 */
+    if (strcmp(val, "chrome") == 0 || strcmp(val, "firefox") == 0 ||
+        strcmp(val, "safari") == 0 || strcmp(val, "edge") == 0 ||
+        strcmp(val, "brave") == 0 || strcmp(val, "opera") == 0 ||
+        strcmp(val, "chromium") == 0 || strcmp(val, "vivaldi") == 0) {
+        snprintf(g_bot.ytdlp_cookie_opt, sizeof(g_bot.ytdlp_cookie_opt),
+                 "--cookies-from-browser %s", val);
+        LOG_I("yt-dlp Cookie設定: --cookies-from-browser %s", val);
+    } else if (strcmp(val, "none") == 0 || strcmp(val, "なし") == 0) {
+        g_bot.ytdlp_cookie_opt[0] = '\0';
+        LOG_I("yt-dlp Cookie設定: 無効化");
+    } else {
+        /* ファイルパスとして扱う */
+        snprintf(g_bot.ytdlp_cookie_opt, sizeof(g_bot.ytdlp_cookie_opt),
+                 "--cookies \"%s\"", val);
+        LOG_I("yt-dlp Cookie設定: --cookies %s", val);
+    }
+    return hajimu_bool(true);
 }
 
 /* YouTubeタイトル(URL) — URLからタイトルだけ取得 (軽量) */
@@ -9190,6 +9380,7 @@ static HajimuPluginFunc functions[] = {
     {"投票終了",             fn_poll_end,          2,  2},
 
     /* ボイスチャンネル (v2.0.0) */
+    {"ユーザーボイスチャンネル", fn_get_user_voice_channel, 2, 2},
     {"VC接続",               fn_vc_join,           2,  2},
     {"VC切断",               fn_vc_leave,          1,  1},
     {"音声再生",             fn_voice_play,        2,  2},
@@ -9202,10 +9393,11 @@ static HajimuPluginFunc functions[] = {
     {"VC状態",               fn_vc_status,         1,  1},
     {"音声音量",             fn_voice_volume,      2,  2},
 
-    /* YouTube / yt-dlp (v2.4.0) */
+    /* YouTube / yt-dlp (v2.4.0+) */
     {"YouTube情報",          fn_ytdlp_info,        1,  1},
     {"YouTube検索",          fn_ytdlp_search,      1,  2},
     {"YouTubeタイトル",      fn_ytdlp_title,       1,  1},
+    {"YouTubeクッキー設定",  fn_ytdlp_set_cookies, 1,  1},
 
     /* ステージチャンネル (v2.1.0) */
     {"ステージ開始",         fn_stage_start,       2,  3},

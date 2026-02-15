@@ -377,6 +377,7 @@ typedef struct {
     int  voice_port;
     unsigned char secret_key[32];
     bool ready;
+    uint32_t voice_nonce;  /* incrementing nonce for AEAD encryption */
 
     /* UDP */
     int udp_fd;
@@ -1914,6 +1915,43 @@ static void gw_handle_ready(JsonNode *data) {
 }
 
 /* Process INTERACTION_CREATE — slash commands */
+/* --- Async callback execution (v2.5.0) --- */
+/* Run command/component callbacks in a detached thread so the gateway
+   thread can keep receiving events (crucial for voice connect flow). */
+typedef struct {
+    Value    callback;
+    Value    arg;
+    char     label[64];   /* for debug logging */
+} AsyncCallbackArg;
+
+static void *async_callback_thread(void *ptr) {
+    AsyncCallbackArg *a = (AsyncCallbackArg *)ptr;
+    pthread_mutex_lock(&g_bot.callback_mutex);
+    if (hajimu_runtime_available()) {
+        LOG_I("CMD: '%s' コールバック開始", a->label);
+        hajimu_call(&a->callback, 1, &a->arg);
+        LOG_I("CMD: '%s' コールバック完了", a->label);
+    }
+    pthread_mutex_unlock(&g_bot.callback_mutex);
+    free(a);
+    return NULL;
+}
+
+static void run_callback_async(Value *callback, Value *arg, const char *label) {
+    AsyncCallbackArg *a = (AsyncCallbackArg *)calloc(1, sizeof(AsyncCallbackArg));
+    if (!a) return;
+    a->callback = *callback;
+    a->arg = *arg;
+    snprintf(a->label, sizeof(a->label), "%s", label ? label : "?");
+    pthread_t t;
+    if (pthread_create(&t, NULL, async_callback_thread, a) == 0) {
+        pthread_detach(t);
+    } else {
+        LOG_E("コールバックスレッド作成失敗: %s", label);
+        free(a);
+    }
+}
+
 static void gw_handle_interaction(JsonNode *data) {
     int type = (int)json_get_num(data, "type");
 
@@ -1947,14 +1985,8 @@ static void gw_handle_interaction(JsonNode *data) {
 
                 event_fire("INTERACTION_CREATE", 1, &interaction);
 
-                /* Call specific command handler */
-                pthread_mutex_lock(&g_bot.callback_mutex);
-                if (hajimu_runtime_available()) {
-                    LOG_I("CMD: '%s' コールバック開始", cmd_name);
-                    hajimu_call(&g_bot.commands[i].callback, 1, &interaction);
-                    LOG_I("CMD: '%s' コールバック完了", cmd_name);
-                }
-                pthread_mutex_unlock(&g_bot.callback_mutex);
+                /* Call specific command handler (async to not block gateway) */
+                run_callback_async(&g_bot.commands[i].callback, &interaction, cmd_name);
                 return;
             }
         }
@@ -1986,11 +2018,7 @@ static void gw_handle_interaction(JsonNode *data) {
         for (int i = 0; i < g_bot.comp_handler_count; i++) {
             if (strcmp(g_bot.comp_handlers[i].custom_id, custom_id) == 0 &&
                 (g_bot.comp_handlers[i].type == comp_type || g_bot.comp_handlers[i].type == 0)) {
-                pthread_mutex_lock(&g_bot.callback_mutex);
-                if (hajimu_runtime_available()) {
-                    hajimu_call(&g_bot.comp_handlers[i].callback, 1, &interaction);
-                }
-                pthread_mutex_unlock(&g_bot.callback_mutex);
+                run_callback_async(&g_bot.comp_handlers[i].callback, &interaction, custom_id);
                 return;
             }
         }
@@ -2017,11 +2045,7 @@ static void gw_handle_interaction(JsonNode *data) {
         /* Find registered autocomplete handler */
         for (int i = 0; i < g_bot.autocomplete_count; i++) {
             if (strcmp(g_bot.autocomplete_handlers[i].command_name, cmd_name) == 0) {
-                pthread_mutex_lock(&g_bot.callback_mutex);
-                if (hajimu_runtime_available()) {
-                    hajimu_call(&g_bot.autocomplete_handlers[i].callback, 1, &interaction);
-                }
-                pthread_mutex_unlock(&g_bot.callback_mutex);
+                run_callback_async(&g_bot.autocomplete_handlers[i].callback, &interaction, cmd_name);
                 return;
             }
         }
@@ -2044,11 +2068,7 @@ static void gw_handle_interaction(JsonNode *data) {
         for (int i = 0; i < g_bot.comp_handler_count; i++) {
             if (strcmp(g_bot.comp_handlers[i].custom_id, custom_id) == 0 &&
                 g_bot.comp_handlers[i].type == -1) { /* -1 = modal */
-                pthread_mutex_lock(&g_bot.callback_mutex);
-                if (hajimu_runtime_available()) {
-                    hajimu_call(&g_bot.comp_handlers[i].callback, 1, &interaction);
-                }
-                pthread_mutex_unlock(&g_bot.callback_mutex);
+                run_callback_async(&g_bot.comp_handlers[i].callback, &interaction, custom_id);
                 return;
             }
         }
@@ -2571,7 +2591,21 @@ static void voice_free(VoiceConn *vc) {
     vc->stop_requested = true;
     vc->playing = false;
 
-    /* Close voice WebSocket */
+    /* Signal voice_ws_thread to exit (it checks stop_requested with 1s timeout) */
+    /* Do NOT call ws_close here — the voice_ws_thread is still using the SSL
+       connection. It will exit within 1 second via the stop_requested flag. */
+
+    /* Wait for threads to exit first (they'll see stop_requested) */
+    if (vc->voice_ws_thread) {
+        pthread_join(vc->voice_ws_thread, NULL);
+        vc->voice_ws_thread = 0;
+    }
+    if (vc->audio_thread) {
+        pthread_join(vc->audio_thread, NULL);
+        vc->audio_thread = 0;
+    }
+
+    /* Now safe to clean up resources — no threads are using them */
     if (vc->vws.connected) {
         ws_close(&vc->vws);
     }
@@ -2586,16 +2620,6 @@ static void voice_free(VoiceConn *vc) {
     if (vc->opus_enc) {
         opus_encoder_destroy(vc->opus_enc);
         vc->opus_enc = NULL;
-    }
-
-    /* Wait for threads */
-    if (vc->voice_ws_thread) {
-        pthread_join(vc->voice_ws_thread, NULL);
-        vc->voice_ws_thread = 0;
-    }
-    if (vc->audio_thread) {
-        pthread_join(vc->audio_thread, NULL);
-        vc->audio_thread = 0;
     }
 
     pthread_mutex_destroy(&vc->voice_mutex);
@@ -2794,7 +2818,7 @@ static void voice_send_select_protocol(VoiceConn *vc) {
     jb_key(&sb, "data"); jb_obj_start(&sb);
     jb_str(&sb, "address", vc->external_ip);
     jb_int(&sb, "port", vc->external_port);
-    jb_str(&sb, "mode", "xsalsa20_poly1305");
+    jb_str(&sb, "mode", "aead_xchacha20_poly1305_rtpsize");
     jb_obj_end(&sb); sb_append_char(&sb, ',');
     jb_obj_end(&sb); sb_append_char(&sb, ',');
     jb_obj_end(&sb);
@@ -2869,18 +2893,30 @@ static int voice_ip_discovery(VoiceConn *vc) {
     }
 
     /* Receive response: same 74-byte format with our external IP+port filled in */
-    uint8_t resp[74];
+    uint8_t resp[256];
     socklen_t addr_len = sizeof(vc->udp_addr);
-    ssize_t rcvd = recvfrom(vc->udp_fd, resp, sizeof(resp), 0,
-                            (struct sockaddr *)&vc->udp_addr, &addr_len);
-    if (rcvd < 74) {
-        LOG_E("Voice IP Discovery応答不正 (%zd bytes)", rcvd);
+    ssize_t rcvd = -1;
+    /* Retry up to 3 times (Discord may drop first packet) */
+    for (int attempt = 0; attempt < 3 && rcvd < 8; attempt++) {
+        if (attempt > 0) {
+            LOG_I("Voice IP Discovery リトライ (%d/3)", attempt + 1);
+            /* Resend discovery packet */
+            sendto(vc->udp_fd, disc_pkt, sizeof(disc_pkt), 0,
+                   (struct sockaddr *)&vc->udp_addr, sizeof(vc->udp_addr));
+        }
+        rcvd = recvfrom(vc->udp_fd, resp, sizeof(resp), 0,
+                        (struct sockaddr *)&vc->udp_addr, &addr_len);
+        if (rcvd >= 8) break;
+        LOG_I("Voice IP Discovery recvfrom: %zd (errno=%d: %s)", rcvd, errno, strerror(errno));
+    }
+    if (rcvd < 8) {
+        LOG_E("Voice IP Discovery応答不正 (%zd bytes, errno=%d: %s)", rcvd, errno, strerror(errno));
         return -1;
     }
 
-    /* Extract IP (bytes 8-71) and port (bytes 72-73, big-endian) */
+    /* Extract IP (bytes 8..71) and port (last 2 bytes, big-endian) */
     snprintf(vc->external_ip, sizeof(vc->external_ip), "%s", (char *)&resp[8]);
-    vc->external_port = ((uint16_t)resp[72] << 8) | resp[73];
+    vc->external_port = ((uint16_t)resp[rcvd - 2] << 8) | resp[rcvd - 1];
 
     LOG_I("Voice IP Discovery完了: %s:%d", vc->external_ip, vc->external_port);
     return 0;
@@ -2895,16 +2931,21 @@ static void *voice_ws_thread_func(void *arg) {
     char host[256] = {0};
     snprintf(host, sizeof(host), "%s", vc->endpoint);
 
-    /* Remove :80 or trailing port */
+    /* Extract port if present, otherwise default to 443 */
+    int ws_port = 443;
     char *colon = strrchr(host, ':');
-    if (colon) *colon = '\0';
+    if (colon) {
+        ws_port = atoi(colon + 1);
+        if (ws_port <= 0 || ws_port > 65535) ws_port = 443;
+        *colon = '\0';
+    }
 
     /* Build path */
     char path[512];
     snprintf(path, sizeof(path), "/?v=4");
 
-    LOG_I("Voice WebSocketに接続中... (%s)", host);
-    if (voice_ws_connect_raw(&vc->vws, host, 443, path) < 0) {
+    LOG_I("Voice WebSocketに接続中... (%s:%d)", host, ws_port);
+    if (voice_ws_connect_raw(&vc->vws, host, ws_port, path) < 0) {
         LOG_E("Voice WebSocket接続失敗");
         return NULL;
     }
@@ -2915,15 +2956,15 @@ static void *voice_ws_thread_func(void *arg) {
     /* Read messages */
     time_t last_heartbeat = time(NULL);
 
-    while (vc->active && vc->vws.connected && !g_shutdown) {
+    while (vc->active && vc->vws.connected && !g_shutdown && !vc->stop_requested) {
         /* Set short read timeout for heartbeating */
         struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
         setsockopt(vc->vws.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
         char *msg = voice_ws_read(&vc->vws);
         if (!msg) {
-            /* Check if it's just a timeout */
-            if (vc->active && vc->vws.connected && !g_shutdown) {
+            /* Check if it's just a timeout (not a disconnect request) */
+            if (vc->active && vc->vws.connected && !g_shutdown && !vc->stop_requested) {
                 /* Send heartbeat if interval elapsed */
                 if (vc->voice_heartbeat_interval > 0) {
                     time_t now = time(NULL);
@@ -2942,6 +2983,7 @@ static void *voice_ws_thread_func(void *arg) {
 
         int op = (int)json_get_num(root, "op");
         JsonNode *d = json_get(root, "d");
+        LOG_I("Voice WS受信: op=%d, raw=%.200s", op, msg);
 
         switch (op) {
         case 8: { /* HELLO — get heartbeat_interval */
@@ -2963,6 +3005,15 @@ static void *voice_ws_thread_func(void *arg) {
                 if (ip) snprintf(vc->voice_ip, sizeof(vc->voice_ip), "%s", ip);
                 vc->voice_port = port;
                 LOG_I("Voice READY: ssrc=%u, ip=%s, port=%d", vc->ssrc, vc->voice_ip, vc->voice_port);
+
+                /* Log available modes */
+                JsonNode *modes = json_get(d, "modes");
+                if (modes && modes->type == JSON_ARRAY) {
+                    for (int mi = 0; mi < modes->arr.count && mi < 10; mi++) {
+                        if (modes->arr.items[mi].type == JSON_STRING)
+                            LOG_I("Voice mode[%d]: %s", mi, modes->arr.items[mi].str);
+                    }
+                }
 
                 /* Perform IP Discovery */
                 if (voice_ip_discovery(vc) == 0) {
@@ -2995,7 +3046,7 @@ static void *voice_ws_thread_func(void *arg) {
                         LOG_E("Opusエンコーダー作成失敗: %s", opus_strerror(err));
                         vc->ready = false;
                     } else {
-                        opus_encoder_ctl(vc->opus_enc, OPUS_SET_BITRATE(64000));
+                        opus_encoder_ctl(vc->opus_enc, OPUS_SET_BITRATE(128000));
                         LOG_I("Opusエンコーダー初期化完了");
                     }
 
@@ -3065,14 +3116,24 @@ static bool wav_read_header(FILE *fp, int *channels, int *sample_rate, int *bits
 static bool voice_filepath_safe(const char *path) {
     /* Reject empty paths */
     if (!path || !*path) return false;
-    /* Reject characters that could cause shell injection in popen */
+
+    /* For URLs, only reject the most dangerous shell metacharacters.
+     * URLs legitimately contain &, =, ?, etc. but since we use "%s"
+     * (double-quoted) in popen, only backtick, $, \, ", newline are dangerous. */
+    bool is_url = (strncmp(path, "http://", 7) == 0 || strncmp(path, "https://", 8) == 0);
+
     for (const char *p = path; *p; p++) {
         switch (*p) {
-            case '`': case '$': case '\\': case '"': case '\'':
-            case ';': case '|': case '&': case '<': case '>':
-            case '(': case ')': case '{': case '}':
+            case '`': case '$': case '\\': case '"':
             case '\n': case '\r':
                 return false;
+            case ';': case '|': case '<': case '>':
+            case '(': case ')': case '{': case '}': case '\'':
+                if (!is_url) return false;
+                break;
+            case '&':
+                if (!is_url) return false;
+                break;
         }
     }
     return true;
@@ -3188,7 +3249,7 @@ static void *voice_audio_thread_func(void *arg) {
                 /* YouTube/streaming: yt-dlp → ffmpeg pipe */
                 LOG_I("yt-dlp経由で再生: %s", filepath);
                 snprintf(cmd, sizeof(cmd),
-                    "yt-dlp -o - -f bestaudio --no-playlist --no-warnings %s \"%s\" 2>/dev/null | "
+                    "yt-dlp -o - -f bestaudio --no-playlist --no-warnings %s \"%s\" 2>/tmp/hajimu_ytdlp_err.log | "
                     "ffmpeg -i pipe:0 -f s16le -ar %d -ac %d -loglevel error -",
                     g_bot.ytdlp_cookie_opt[0] ? g_bot.ytdlp_cookie_opt : "",
                     filepath, VOICE_SAMPLE_RATE, VOICE_CHANNELS);
@@ -3204,6 +3265,7 @@ static void *voice_audio_thread_func(void *arg) {
                 vc->playing = false;
                 continue;
             }
+            LOG_I("パイプ起動成功: %s", cmd);
         }
 
         /* Send SPEAKING */
@@ -3212,28 +3274,53 @@ static void *voice_audio_thread_func(void *arg) {
         /* Initialize RTP counters */
         vc->rtp_seq = 0;
         vc->rtp_timestamp = 0;
+        vc->voice_nonce = 0;
 
         /* Audio loop: read PCM, Opus encode, encrypt, send RTP */
         int16_t pcm_buf[VOICE_FRAME_SIZE]; /* 960 * 2 = 1920 samples */
         uint8_t opus_buf[VOICE_MAX_PACKET];
-        uint8_t packet[VOICE_MAX_PACKET + 12 + crypto_secretbox_MACBYTES];
+        uint8_t packet[VOICE_MAX_PACKET + 12 + crypto_aead_xchacha20poly1305_ietf_ABYTES + 4];
 
-        struct timespec frame_start, frame_end;
+        /* Use absolute time-based scheduling to prevent timing drift */
+        struct timespec send_start;
+        clock_gettime(CLOCK_MONOTONIC, &send_start);
+        uint64_t frames_sent = 0;
 
         while (vc->playing && !vc->stop_requested && !g_shutdown) {
             /* Handle pause */
             if (vc->paused) {
                 usleep(50000); /* 50ms */
+                /* Reset timing base after unpause */
+                clock_gettime(CLOCK_MONOTONIC, &send_start);
+                frames_sent = 0;
                 continue;
             }
-
-            clock_gettime(CLOCK_MONOTONIC, &frame_start);
 
             /* Read PCM data (VOICE_FRAME_SIZE samples * 2 bytes) */
             size_t read_bytes = fread(pcm_buf, sizeof(int16_t), VOICE_FRAME_SIZE, fp);
             if (read_bytes == 0) {
-                /* EOF */
+                /* EOF — check if yt-dlp had errors */
+                if (vc->rtp_seq == 0) {
+                    LOG_E("音声データが取得できませんでした (seq=0)");
+                    /* Read yt-dlp error log */
+                    FILE *errf = fopen("/tmp/hajimu_ytdlp_err.log", "r");
+                    if (errf) {
+                        char errbuf[512];
+                        while (fgets(errbuf, sizeof(errbuf), errf)) {
+                            /* Remove trailing newline */
+                            char *nl = strchr(errbuf, '\n');
+                            if (nl) *nl = '\0';
+                            if (errbuf[0]) LOG_E("yt-dlp: %s", errbuf);
+                        }
+                        fclose(errf);
+                    }
+                } else {
+                    LOG_I("音声データ読み取り完了 (EOF, seq=%u)", vc->rtp_seq);
+                }
                 break;
+            }
+            if (vc->rtp_seq % 500 == 0) {
+                LOG_I("音声送信中... seq=%u, bytes=%zu", vc->rtp_seq, read_bytes);
             }
             /* Pad with silence if partial frame */
             if ((int)read_bytes < VOICE_FRAME_SIZE) {
@@ -3264,26 +3351,39 @@ static void *voice_audio_thread_func(void *arg) {
             rtp_header[10] = (vc->ssrc >> 8) & 0xFF;
             rtp_header[11] = vc->ssrc & 0xFF;
 
-            /* XSalsa20-Poly1305 encryption:
-             * nonce = 24 bytes: RTP header (12) + 12 zero bytes */
+            /* AEAD XChaCha20-Poly1305 (rtpsize) encryption:
+             * nonce = 24 bytes: 4-byte counter (big-endian) + 20 zero bytes
+             * AAD = RTP header (12 bytes)
+             * 4-byte nonce suffix appended to packet */
+            uint32_t nonce_val = vc->voice_nonce++;
             uint8_t nonce[24];
             memset(nonce, 0, sizeof(nonce));
-            memcpy(nonce, rtp_header, 12);
+            nonce[0] = (nonce_val >> 24) & 0xFF;
+            nonce[1] = (nonce_val >> 16) & 0xFF;
+            nonce[2] = (nonce_val >> 8) & 0xFF;
+            nonce[3] = nonce_val & 0xFF;
 
-            /* Encrypt opus data */
-            uint8_t encrypted[VOICE_MAX_PACKET + crypto_secretbox_MACBYTES];
-            if (crypto_secretbox_easy(encrypted, opus_buf, (unsigned long long)opus_len,
-                                      nonce, vc->secret_key) != 0) {
+            /* Encrypt opus data with AEAD (authenticated with RTP header as AAD) */
+            uint8_t encrypted[VOICE_MAX_PACKET + crypto_aead_xchacha20poly1305_ietf_ABYTES];
+            unsigned long long clen = 0;
+            if (crypto_aead_xchacha20poly1305_ietf_encrypt(
+                    encrypted, &clen,
+                    opus_buf, (unsigned long long)opus_len,
+                    rtp_header, 12,  /* AAD = RTP header */
+                    NULL, nonce, vc->secret_key) != 0) {
                 LOG_E("音声暗号化失敗");
                 break;
             }
 
-            int encrypted_len = opus_len + (int)crypto_secretbox_MACBYTES;
-
-            /* Assemble final packet: RTP header + encrypted audio */
+            /* Assemble final packet: RTP header + encrypted audio + 4-byte nonce suffix */
             memcpy(packet, rtp_header, 12);
-            memcpy(packet + 12, encrypted, (size_t)encrypted_len);
-            int total_len = 12 + encrypted_len;
+            memcpy(packet + 12, encrypted, (size_t)clen);
+            /* Append 4-byte nonce at end */
+            packet[12 + (int)clen]     = nonce[0];
+            packet[12 + (int)clen + 1] = nonce[1];
+            packet[12 + (int)clen + 2] = nonce[2];
+            packet[12 + (int)clen + 3] = nonce[3];
+            int total_len = 12 + (int)clen + 4;
 
             /* Send via UDP */
             ssize_t sent = sendto(vc->udp_fd, packet, (size_t)total_len, 0,
@@ -3295,16 +3395,19 @@ static void *voice_audio_thread_func(void *arg) {
 
             vc->rtp_seq++;
             vc->rtp_timestamp += VOICE_FRAME_SAMPLES;
+            frames_sent++;
 
-            /* Sleep for remainder of 20ms frame */
-            clock_gettime(CLOCK_MONOTONIC, &frame_end);
-            long elapsed_ns = (frame_end.tv_sec - frame_start.tv_sec) * 1000000000L +
-                              (frame_end.tv_nsec - frame_start.tv_nsec);
-            long target_ns = VOICE_FRAME_MS * 1000000L; /* 20ms */
+            /* Sleep until next frame's absolute deadline (prevents timing drift) */
+            long long target_ns = (long long)frames_sent * VOICE_FRAME_MS * 1000000LL;
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long long elapsed_ns = (long long)(now.tv_sec - send_start.tv_sec) * 1000000000LL +
+                                   (long long)(now.tv_nsec - send_start.tv_nsec);
             if (elapsed_ns < target_ns) {
                 struct timespec sleep_ts;
-                sleep_ts.tv_sec = 0;
-                sleep_ts.tv_nsec = target_ns - elapsed_ns;
+                long long sleep_ns = target_ns - elapsed_ns;
+                sleep_ts.tv_sec = (time_t)(sleep_ns / 1000000000LL);
+                sleep_ts.tv_nsec = (long)(sleep_ns % 1000000000LL);
                 nanosleep(&sleep_ts, NULL);
             }
         }
@@ -3330,15 +3433,28 @@ static void *voice_audio_thread_func(void *arg) {
 
             uint8_t nonce[24];
             memset(nonce, 0, sizeof(nonce));
-            memcpy(nonce, rtp_header, 12);
+            uint32_t sil_nonce_val = vc->voice_nonce++;
+            nonce[0] = (sil_nonce_val >> 24) & 0xFF;
+            nonce[1] = (sil_nonce_val >> 16) & 0xFF;
+            nonce[2] = (sil_nonce_val >> 8) & 0xFF;
+            nonce[3] = sil_nonce_val & 0xFF;
 
-            uint8_t enc_silence[3 + crypto_secretbox_MACBYTES];
-            crypto_secretbox_easy(enc_silence, silence, 3, nonce, vc->secret_key);
+            uint8_t enc_silence[3 + crypto_aead_xchacha20poly1305_ietf_ABYTES];
+            unsigned long long sil_clen = 0;
+            crypto_aead_xchacha20poly1305_ietf_encrypt(
+                enc_silence, &sil_clen,
+                silence, 3,
+                rtp_header, 12,
+                NULL, nonce, vc->secret_key);
 
-            uint8_t pkt[12 + 3 + crypto_secretbox_MACBYTES];
+            uint8_t pkt[12 + 3 + crypto_aead_xchacha20poly1305_ietf_ABYTES + 4];
             memcpy(pkt, rtp_header, 12);
-            memcpy(pkt + 12, enc_silence, 3 + crypto_secretbox_MACBYTES);
-            sendto(vc->udp_fd, pkt, sizeof(pkt), 0,
+            memcpy(pkt + 12, enc_silence, (size_t)sil_clen);
+            pkt[12 + (int)sil_clen]     = nonce[0];
+            pkt[12 + (int)sil_clen + 1] = nonce[1];
+            pkt[12 + (int)sil_clen + 2] = nonce[2];
+            pkt[12 + (int)sil_clen + 3] = nonce[3];
+            sendto(vc->udp_fd, pkt, (size_t)(12 + (int)sil_clen + 4), 0,
                    (struct sockaddr *)&vc->udp_addr, sizeof(vc->udp_addr));
 
             vc->rtp_seq++;
@@ -3356,10 +3472,12 @@ static void *voice_audio_thread_func(void *arg) {
         vc->playing = false;
         LOG_I("音声再生完了: %s", filepath);
 
-        /* Fire event */
-        Value done_val = hajimu_string(filepath);
-        event_fire("音声再生完了", 1, &done_val);
-        event_fire("VOICE_PLAY_END", 1, &done_val);
+        /* Fire event — skip if disconnecting to avoid deadlock with callback_mutex */
+        if (!vc->stop_requested) {
+            Value done_val = hajimu_string(filepath);
+            event_fire("音声再生完了", 1, &done_val);
+            event_fire("VOICE_PLAY_END", 1, &done_val);
+        }
 
         /* Check loop mode (re-queue) */
         if (vc->loop_mode && !vc->stop_requested) {
@@ -6795,8 +6913,9 @@ static Value fn_vc_status(int argc, Value *argv) {
     /* Return a map-like string with status info */
     char buf[512];
     snprintf(buf, sizeof(buf),
-        "{\"接続中\":true,\"チャンネル\":\"%s\",\"再生中\":%s,"
+        "{\"接続中\":true,\"準備完了\":%s,\"チャンネル\":\"%s\",\"再生中\":%s,"
         "\"一時停止\":%s,\"キュー数\":%d,\"ループ\":%s}",
+        vc->ready ? "true" : "false",
         vc->channel_id,
         vc->playing ? "true" : "false",
         vc->paused ? "true" : "false",

@@ -2,7 +2,7 @@
   <img src="https://img.shields.io/badge/言語-はじむ-ff6b6b?style=for-the-badge" alt="はじむ">
   <img src="https://img.shields.io/badge/Discord_API-v10-5865F2?style=for-the-badge&logo=discord&logoColor=white" alt="Discord API v10">
   <img src="https://img.shields.io/badge/license-MIT-green?style=for-the-badge" alt="MIT License">
-  <img src="https://img.shields.io/badge/version-2.3.0-blue?style=for-the-badge" alt="v2.3.0">
+  <img src="https://img.shields.io/badge/version-2.6.0-blue?style=for-the-badge" alt="v2.6.0">
   <img src="https://img.shields.io/badge/関数数-252-orange?style=for-the-badge" alt="252 functions">
 </p>
 
@@ -414,12 +414,18 @@ Discord でサーバーに `!hello` と送ると、Bot が「こんにちは！�
 
 ### Step 15: ボイスチャンネル
 
+ローカルファイルと YouTube URL の両方に対応しています。
+
 ```
+// VCに接続してローカルファイルを再生
 ボット.VC接続(サーバーID, ボイスチャンネルID)
 
 ボット.イベント("ボイス接続完了", 関数(ギルドID):
     ボット.音声再生(ギルドID, "/path/to/music.mp3")
 )
+
+// YouTube URL を直接再生 (yt-dlp 必須)
+ボット.音声再生(サーバーID, "https://www.youtube.com/watch?v=...")
 
 ボット.音声一時停止(サーバーID)
 ボット.音声再開(サーバーID)
@@ -427,6 +433,9 @@ Discord でサーバーに `!hello` と送ると、Bot が「こんにちは！�
 ボット.音声ループ(サーバーID, 真)
 ボット.VC切断(サーバーID)
 ```
+
+> **ボイス要件:** libopus, libsodium, ffmpeg, yt-dlp (YouTube再生時)
+> **暗号化:** AEAD XChaCha20-Poly1305 (Discord最新仕様)
 
 ### Step 16: サーバー管理拡張 <sup>v2.3</sup>
 
@@ -1265,6 +1274,27 @@ hajimu パッケージ 更新 ReoShiozawa/hajimu-discord
 
 ## 📜 変更履歴
 
+### v2.6.0 (2026-02-15)
+
+**ボイス音声品質・安定性の大幅改善**
+
+- **AEAD暗号化移行**: Discord非推奨の `xsalsa20_poly1305` から `aead_xchacha20_poly1305_rtpsize` へ移行
+- **非同期コールバック**: スラッシュコマンドを非同期スレッドで実行し、Gatewayスレッドのブロックを解消
+- **音声品質向上**: Opusビットレート 64kbps→128kbps、絶対時間ベースフレームスケジューリングでタイミングドリフト防止
+- **VC切断デッドロック修正**: `voice_free()` のスレッドjoin順序を修正し、SSL解放競合を解消
+- **IP Discovery改善**: リトライロジック（3回）、大容量バッファ、柔軟なポート抽出
+- **Voice WSポート対応**: Discordエンドポイントからポートを動的抽出（443固定を廃止）
+- **YouTube再生安定化**: yt-dlp エラーログ出力、URL中の `&` 文字許可、stderrログ保存
+- **サイレンスフレーム暗号化更新**: AEAD XChaCha20-Poly1305 に統一
+
+### v2.5.0 (2026-02-15)
+
+**yt-dlp Cookie対応 + バグ修正**
+
+- yt-dlp Cookie自動検出 (`cookies.txt` / `--cookies-from-browser`)
+- `偶`→`偽` 真偽値バグ修正
+- バッファオーバーフロー修正 (`ep[256]`→`ep[512]`)
+
 ### v2.3.0 (2026-02-14)
 
 **discord.js/discord.py 互換性強化** — +39関数、Gateway 40+種イベント対応
@@ -1324,5 +1354,5 @@ MIT License — 詳細は [LICENSE](LICENSE) を参照
 
 <p align="center">
   <sub>はじむ言語で Discord Bot を作ろう 🤖</sub><br>
-  <sub>252 関数 ・ 40+ イベント ・ 完全日本語 API</sub>
+  <sub>252 関数 ・ 40+ イベント ・ 完全日本語 API ・ YouTube再生対応</sub>
 </p>

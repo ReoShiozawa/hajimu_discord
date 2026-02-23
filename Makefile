@@ -148,9 +148,25 @@ endif
 # ターゲット
 # =============================================================================
 
-.PHONY: all clean install uninstall test help
+.PHONY: all deps-check clean install uninstall test help
 
-all: $(OUT)
+# deps-check: 必要な依存ライブラリを自動インストール
+# Windows (MSYS2): pacman -S --noconfirm --needed でスキップしつつ自動インストール
+# macOS: brew install (存在しない場合のみ)
+deps-check:
+ifeq ($(OS),Windows_NT)
+	@command -v pacman >/dev/null 2>&1 && \
+		echo "  依存ライブラリを確認中 (MSYS2 pacman)..." && \
+		pacman -S --noconfirm --needed \
+			mingw-w64-x86_64-openssl \
+			mingw-w64-x86_64-curl \
+			mingw-w64-x86_64-gcc \
+	|| echo "  ヒント: MSYS2 MinGW64 コンソールから実行してください (https://www.msys2.org/)"
+else ifeq ($(DETECTED_OS),Darwin)
+	@command -v openssl >/dev/null 2>&1 || brew install openssl curl
+endif
+
+all: deps-check $(OUT)
 	@echo ""
 	@echo "  ビルド完了: $(OUT)"
 ifeq ($(OS),Windows_NT)
@@ -173,8 +189,8 @@ endif
 install: $(OUT)
 ifeq ($(OS),Windows_NT)
 	if not exist "$(INSTALL_DIR)\$(PLUGIN_NAME)" mkdir "$(INSTALL_DIR)\$(PLUGIN_NAME)"
-	copy /Y $(OUT) "$(INSTALL_DIR)\$(PLUGIN_NAME)\"
-	copy /Y hajimu.json "$(INSTALL_DIR)\$(PLUGIN_NAME)\"
+	copy /Y $(OUT) "$(INSTALL_DIR)\$(PLUGIN_NAME)"
+	copy /Y hajimu.json "$(INSTALL_DIR)\$(PLUGIN_NAME)"
 else
 	@mkdir -p $(INSTALL_DIR)/$(PLUGIN_NAME)
 	cp $(OUT) $(INSTALL_DIR)/$(PLUGIN_NAME)/

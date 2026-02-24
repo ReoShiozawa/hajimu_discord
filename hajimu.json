@@ -4,6 +4,6 @@
   "説明": "はじむ言語用 Discord Bot 開発プラグイン — Gateway v10 / REST v10 対応",
   "作者": "はじむ開発チーム",
   "メイン": "hajimu_discord.hjp",
-  "ビルド": "make",
+  "ビルド": "make hajimu_discord.hjp",
   "依存": {}
 }

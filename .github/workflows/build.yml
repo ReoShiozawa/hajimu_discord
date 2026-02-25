@@ -35,13 +35,15 @@ jobs:
         shell: bash
         run: mkdir -p include && cp -r _hajimu/include/. include/
 
-      # ── macOS: OpenSSL (Homebrew) ────────────────────
+      # ── macOS: OpenSSL / Opus / libsodium (Homebrew) ─
       - name: 依存インストール (macOS)
         if: runner.os == 'macOS'
         run: |
           brew install openssl opus libsodium
-          # Homebrew OpenSSL パスを Makefile に渡す
-          echo "OPENSSL_PREFIX=$(brew --prefix openssl)" >> "$GITHUB_ENV"
+          # pkg-config が Homebrew パッケージを検出できるようパスを追加
+          BREW_PREFIX="$(brew --prefix)"
+          echo "PKG_CONFIG_PATH=${BREW_PREFIX}/opt/openssl/lib/pkgconfig:${BREW_PREFIX}/opt/opus/lib/pkgconfig:${BREW_PREFIX}/opt/libsodium/lib/pkgconfig:${BREW_PREFIX}/lib/pkgconfig" >> "$GITHUB_ENV"
+          echo "OPENSSL_PREFIX=${BREW_PREFIX}/opt/openssl" >> "$GITHUB_ENV"
 
       # ── Linux: OpenSSL / Opus / libsodium ───────────
       - name: 依存インストール (Linux)
@@ -53,7 +55,16 @@ jobs:
       # ── macOS / Linux ────────────────────────────────
       - name: ビルド (macOS / Linux)
         if: runner.os != 'Windows'
-        run: make HAJIMU_INCLUDE=include
+        run: |
+          make HAJIMU_INCLUDE=include
+          # ボイスチャンネル機能が有効になっているか検証
+          if file hajimu_discord.hjp | grep -q "shared\|dynamic\|ELF\|Mach-O"; then
+            echo "✅ ビルド成功"
+          fi
+          # HJP_NO_VOICE が定義されたままならビルドを失敗させる
+          if nm hajimu_discord.hjp 2>/dev/null | grep -q "hjp_no_voice_stub\|NO_VOICE"; then
+            echo "❌ ボイスチャンネル機能が無効です (Opus/libsodium が見つかりません)" && exit 1
+          fi
 
       # ── Windows (MSYS2 MINGW64) ──────────────────────
       - name: MSYS2 セットアップ (Windows)
@@ -72,7 +83,12 @@ jobs:
       - name: ビルド (Windows)
         if: runner.os == 'Windows'
         shell: msys2 {0}
-        run: make HAJIMU_INCLUDE=include
+        run: |
+          make HAJIMU_INCLUDE=include
+          # Opus が有効かチェック (-DHJP_NO_VOICE が入っていないこと)
+          if nm hajimu_discord.hjp 2>/dev/null | grep -q "hjp_no_voice_stub\|NO_VOICE"; then
+            echo "❌ ボイスチャンネル機能が無効です" && exit 1
+          fi
 
       # ── アーティファクト整理 ─────────────────────────
       - name: アーティファクトをリネーム

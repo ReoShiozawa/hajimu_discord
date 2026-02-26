@@ -112,7 +112,7 @@ endif
 # =============================================================================
 ifeq ($(OS),Windows_NT)
     # Windows (MinGW/MSYS2): -fPIC 不要、Windows 固有ライブラリを追加
-    CFLAGS  = -Wall -Wextra -O2 -std=c11
+    CFLAGS  = -Wall -Wextra -O2 -std=gnu11
     CFLAGS += -D_WIN32_WINNT=0x0601 -DWIN32_LEAN_AND_MEAN
     CFLAGS += $(OPUS_DEFINE) $(SODIUM_DEFINE)
     CFLAGS += -I$(HAJIMU_INCLUDE) $(OPENSSL_CFLAGS) $(OPUS_CFLAGS) $(SODIUM_CFLAGS)
@@ -125,7 +125,7 @@ ifeq ($(OS),Windows_NT)
 
     INSTALL_DIR = $(USERPROFILE)/.hajimu/plugins
 else ifeq ($(DETECTED_OS),Darwin)
-    CFLAGS  = -Wall -Wextra -O2 -std=c11 -fPIC
+    CFLAGS  = -Wall -Wextra -O2 -std=gnu11 -fPIC
     CFLAGS += $(OPUS_DEFINE) $(SODIUM_DEFINE)
     CFLAGS += -I$(HAJIMU_INCLUDE) $(OPENSSL_CFLAGS) $(OPUS_CFLAGS) $(SODIUM_CFLAGS)
     CFLAGS += -shared -dynamiclib
@@ -135,7 +135,7 @@ else ifeq ($(DETECTED_OS),Darwin)
 
     INSTALL_DIR = $(HOME)/.hajimu/plugins
 else
-    CFLAGS  = -Wall -Wextra -O2 -std=c11 -fPIC
+    CFLAGS  = -Wall -Wextra -O2 -std=gnu11 -fPIC
     CFLAGS += $(OPUS_DEFINE) $(SODIUM_DEFINE)
     CFLAGS += -I$(HAJIMU_INCLUDE) $(OPENSSL_CFLAGS) $(OPUS_CFLAGS) $(SODIUM_CFLAGS)
     CFLAGS += -shared

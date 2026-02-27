@@ -177,6 +177,64 @@ ifeq ($(OS),Windows_NT)
 endif
 	@echo ""
 
+# =============================================================================
+# クロスプラットフォームビルド (dist/ へ出力)
+# macOS:         ネイティブ gcc + Homebrew openssl/curl
+# Linux x86-64:  musl-cross + vendored openssl/curl (静的リンク)
+# Windows x86-64: mingw-w64 + vendored openssl/curl (静的リンク)
+# =============================================================================
+
+DIST         = dist
+HAJIMU_INC   = $(abspath $(firstword $(wildcard ../../jp/include ../jp/include ./include)))
+VENDOR_LINUX = $(abspath vendor/linux)
+VENDOR_WIN   = $(abspath vendor/windows)
+LINUX_CC     ?= x86_64-linux-musl-gcc
+WIN_CC       ?= x86_64-w64-mingw32-gcc
+
+.PHONY: build-all build-macos build-linux build-windows
+
+build-all: build-macos build-linux build-windows
+	@echo "  全プラットフォームビルド完了: $(DIST)/"
+
+build-macos:
+	@mkdir -p $(DIST)
+	gcc -shared -dynamiclib -fPIC -O2 -std=gnu11 \
+	  -I$(HAJIMU_INC) \
+	  -I/opt/homebrew/include \
+	  -I/opt/homebrew/include/opus \
+	  $(SRC) \
+	  -L/opt/homebrew/lib \
+	  -lssl -lcrypto -lcurl -lopus -lsodium -lz -lpthread \
+	  -o $(DIST)/$(PLUGIN_NAME)-macos.hjp
+	@echo "  macOS: $(DIST)/$(PLUGIN_NAME)-macos.hjp"
+
+build-linux:
+	@mkdir -p $(DIST)
+	$(LINUX_CC) -shared -fPIC -O2 -std=gnu11 \
+	  -I$(HAJIMU_INC) \
+	  -I$(VENDOR_LINUX)/include \
+	  -I$(VENDOR_LINUX)/include/opus \
+	  $(SRC) \
+	  -L$(VENDOR_LINUX)/lib64 \
+	  -Wl,-Bstatic -lssl -lcrypto -lcurl -lopus -lsodium -lz -Wl,-Bdynamic \
+	  -lpthread -ldl \
+	  -o $(DIST)/$(PLUGIN_NAME)-linux-x64.hjp
+	@echo "  Linux: $(DIST)/$(PLUGIN_NAME)-linux-x64.hjp"
+
+build-windows:
+	@mkdir -p $(DIST)
+	$(WIN_CC) -shared -O2 -std=gnu11 \
+	  -D_WIN32_WINNT=0x0601 -DWIN32_LEAN_AND_MEAN \
+	  -DCURL_STATICLIB \
+	  -I$(HAJIMU_INC) \
+	  -I$(VENDOR_WIN)/include \
+	  -I$(VENDOR_WIN)/include/opus \
+	  $(SRC) \
+	  -L$(VENDOR_WIN)/lib64 \
+	  -Wl,-Bstatic -lcurl -lssl -lcrypto -lopus -lsodium -lz -Wl,-Bdynamic \
+	  -lws2_32 -lwinmm -lbcrypt -lcrypt32 -lpthread -static-libgcc \
+	  -o $(DIST)/$(PLUGIN_NAME)-windows-x64.hjp
+	@echo "  Windows: $(DIST)/$(PLUGIN_NAME)-windows-x64.hjp"
 $(OUT): $(SRC)
 	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
 

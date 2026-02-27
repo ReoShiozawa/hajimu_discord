@@ -2,3 +2,12 @@
 *.o
 *.dSYM/
 .DS_Store
+
+# vendor ライブラリ（ローカルでビルド、コミットしない）
+vendor/
+
+# ルートレベルの旧ビルド成果物（dist/ を使用）
+hajimu_discord.hjp
+
+# ローカルヘッダーコピー（jp/include から参照）
+include/

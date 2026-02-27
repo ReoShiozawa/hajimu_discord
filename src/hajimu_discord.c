@@ -42,18 +42,68 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdarg.h>
-#include <unistd.h>
 #include <errno.h>
 #include <time.h>
 #include <math.h>
 #include <signal.h>
 #include <pthread.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <netinet/in.h>
-#include <netdb.h>
-#include <arpa/inet.h>
-#include <fcntl.h>
+
+/* --- プラットフォーム別ソケット / POSIX ヘッダー --- */
+#ifdef _WIN32
+  #include <winsock2.h>
+  #include <ws2tcpip.h>
+  #include <windows.h>
+  #include <io.h>
+  #ifndef SHUT_RDWR
+    #define SHUT_RDWR SD_BOTH
+  #endif
+  #ifndef SHUT_RD
+    #define SHUT_RD SD_RECEIVE
+  #endif
+  #ifndef SHUT_WR
+    #define SHUT_WR SD_SEND
+  #endif
+  static inline int usleep_compat(unsigned int us) {
+    Sleep(us / 1000);
+    return 0;
+  }
+  #define usleep usleep_compat
+  #define close(fd) closesocket(fd)
+  typedef int socklen_t;
+  /* Windows の SO_RCVTIMEO/SO_SNDTIMEO は DWORD (ms 単位) で指定する */
+  static inline void sock_set_timeout(int sock, int ms) {
+    DWORD ms_dw = (DWORD)ms;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&ms_dw, sizeof(ms_dw));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&ms_dw, sizeof(ms_dw));
+  }
+  static inline void sock_set_rcvtimeo(int sock, int ms) {
+    DWORD ms_dw = (DWORD)ms;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&ms_dw, sizeof(ms_dw));
+  }
+  static inline int win_setenv(const char *key, const char *val, int overwrite) {
+    (void)overwrite;
+    return SetEnvironmentVariableA(key, val) ? 0 : -1;
+  }
+  #define setenv(k,v,o) win_setenv(k,v,o)
+#else
+  #include <unistd.h>
+  #include <sys/socket.h>
+  #include <sys/time.h>
+  #include <netinet/in.h>
+  #include <netdb.h>
+  #include <arpa/inet.h>
+  #include <fcntl.h>
+  /* POSIX: struct timeval を使った setsockopt ラッパー */
+  static inline void sock_set_timeout(int sock, int sec) {
+    struct timeval tv = {.tv_sec = sec, .tv_usec = 0};
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+  }
+  static inline void sock_set_rcvtimeo(int sock, int sec) {
+    struct timeval tv = {.tv_sec = sec, .tv_usec = 0};
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  }
+#endif
 
 #include <curl/curl.h>
 #include <openssl/ssl.h>
@@ -1110,9 +1160,7 @@ static int ws_connect(WsConn *ws, const char *host, int port, const char *path) 
     }
 
     /* Connect with timeout */
-    struct timeval tv = {.tv_sec = 10, .tv_usec = 0};
-    setsockopt(ws->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(ws->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    sock_set_timeout(ws->fd, 10);
 
     if (connect(ws->fd, res->ai_addr, res->ai_addrlen) < 0) {
         freeaddrinfo(res);
@@ -1189,8 +1237,7 @@ static int ws_connect(WsConn *ws, const char *host, int port, const char *path) 
     ws->zlib_init = true;
 
     /* Set non-blocking read timeout for gateway */
-    tv.tv_sec = 60;
-    setsockopt(ws->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    sock_set_rcvtimeo(ws->fd, 60);
 
     ws->connected = true;
     LOG_I("Gateway接続成功");
@@ -2655,9 +2702,7 @@ static int voice_ws_connect_raw(WsConn *ws, const char *host, int port, const ch
         return -1;
     }
 
-    struct timeval tv = {.tv_sec = 10, .tv_usec = 0};
-    setsockopt(ws->fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(ws->fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    sock_set_timeout(ws->fd, 10);
 
     if (connect(ws->fd, res->ai_addr, res->ai_addrlen) < 0) {
         freeaddrinfo(res);
@@ -2871,8 +2916,7 @@ static int voice_ip_discovery(VoiceConn *vc) {
     inet_pton(AF_INET, vc->voice_ip, &vc->udp_addr.sin_addr);
 
     /* Set timeout */
-    struct timeval tv = {.tv_sec = 5, .tv_usec = 0};
-    setsockopt(vc->udp_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    sock_set_rcvtimeo(vc->udp_fd, 5);
 
     /* Send 74-byte IP Discovery packet:
      * Type (2) = 0x0001, Length (2) = 70, SSRC (4), Address (64), Port (2) */
@@ -2958,8 +3002,7 @@ static void *voice_ws_thread_func(void *arg) {
 
     while (vc->active && vc->vws.connected && !g_shutdown && !vc->stop_requested) {
         /* Set short read timeout for heartbeating */
-        struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
-        setsockopt(vc->vws.fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        sock_set_rcvtimeo(vc->vws.fd, 1);
 
         char *msg = voice_ws_read(&vc->vws);
         if (!msg) {

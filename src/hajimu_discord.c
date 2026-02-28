@@ -53,6 +53,7 @@
   #include <winsock2.h>
   #include <ws2tcpip.h>
   #include <windows.h>
+  #include <wincrypt.h>
   #include <io.h>
   #ifndef SHUT_RDWR
     #define SHUT_RDWR SD_BOTH
@@ -108,6 +109,40 @@
 #include <curl/curl.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/x509.h>
+
+#ifdef _WIN32
+/**
+ * Windows システム証明書ストア (ROOT + CA) から CA 証明書を
+ * OpenSSL の信頼ストアへ読み込む。
+ *
+ * SSL_CTX_set_default_verify_paths() はクロスコンパイル済み OpenSSL を
+ * 使う場合、コンパイル時のパス（/mingw64/ssl/... 等）を参照するが
+ * Windows 実機にはそのパスが存在しないため信頼ストアが空になる。
+ * Windows の場合は Crypt32 API で明示的にロードする必要がある。
+ */
+static int load_windows_ca_store(SSL_CTX *ctx) {
+    static const char *stores[] = { "ROOT", "CA", NULL };
+    X509_STORE *x_store = SSL_CTX_get_cert_store(ctx);
+    int total = 0;
+    for (int si = 0; stores[si]; si++) {
+        HCERTSTORE hStore = CertOpenSystemStoreA(0, stores[si]);
+        if (!hStore) continue;
+        PCCERT_CONTEXT pCtx = NULL;
+        while ((pCtx = CertEnumCertificatesInStore(hStore, pCtx)) != NULL) {
+            const unsigned char *p = pCtx->pbCertEncoded;
+            X509 *x509 = d2i_X509(NULL, &p, (long)pCtx->cbCertEncoded);
+            if (x509) {
+                X509_STORE_add_cert(x_store, x509);
+                X509_free(x509);
+                total++;
+            }
+        }
+        CertCloseStore(hStore, 0);
+    }
+    return total;
+}
+#endif /* _WIN32 */
 #include <openssl/sha.h>
 #include <openssl/rand.h>
 #include <openssl/evp.h>
@@ -1179,12 +1214,21 @@ static int ws_connect(WsConn *ws, const char *host, int port, const char *path) 
     }
     SSL_CTX_set_verify(ws->ssl_ctx, SSL_VERIFY_PEER, NULL);
     SSL_CTX_set_default_verify_paths(ws->ssl_ctx);
+#ifdef _WIN32
+    /* Windows: システム証明書ストアから CA 証明書を明示的にロードする。
+     * クロスコンパイル版 OpenSSL は set_default_verify_paths() で
+     * 存在しないパスを参照するため、信頼ストアが空になり TLS が失敗する。*/
+    if (load_windows_ca_store(ws->ssl_ctx) == 0) {
+        LOG_E("Windows CA証明書ストアのロードに失敗しました");
+    }
+#endif
 
     ws->ssl = SSL_new(ws->ssl_ctx);
     SSL_set_fd(ws->ssl, ws->fd);
     SSL_set_tlsext_host_name(ws->ssl, host);
 
     if (SSL_connect(ws->ssl) <= 0) {
+        ERR_print_errors_fp(stderr);
         LOG_E("TLSハンドシェイク失敗");
         SSL_free(ws->ssl); ws->ssl = NULL;
         SSL_CTX_free(ws->ssl_ctx); ws->ssl_ctx = NULL;
@@ -2715,6 +2759,9 @@ static int voice_ws_connect_raw(WsConn *ws, const char *host, int port, const ch
     if (!ws->ssl_ctx) { close(ws->fd); ws->fd = -1; return -1; }
     SSL_CTX_set_verify(ws->ssl_ctx, SSL_VERIFY_PEER, NULL);
     SSL_CTX_set_default_verify_paths(ws->ssl_ctx);
+#ifdef _WIN32
+    load_windows_ca_store(ws->ssl_ctx);
+#endif
 
     ws->ssl = SSL_new(ws->ssl_ctx);
     SSL_set_fd(ws->ssl, ws->fd);

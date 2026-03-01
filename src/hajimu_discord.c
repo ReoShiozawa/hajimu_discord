@@ -1087,6 +1087,11 @@ static JsonNode *discord_rest(const char *method, const char *endpoint,
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+#ifdef _WIN32
+    /* Windows: クロスコンパイル済み libcurl は CA バンドルを持たないため
+     * CURLSSLOPT_NATIVE_CA でシステム証明書ストアを使用する。*/
+    curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, (long)CURLSSLOPT_NATIVE_CA);
+#endif
 
     if (strcmp(method, "POST") == 0) {
         curl_easy_setopt(curl, CURLOPT_POST, 1L);

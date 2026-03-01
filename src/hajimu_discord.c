@@ -55,6 +55,7 @@
   #include <windows.h>
   #include <wincrypt.h>
   #include <io.h>
+  #include <fcntl.h>   /* _O_BINARY */
   #ifndef SHUT_RDWR
     #define SHUT_RDWR SD_BOTH
   #endif
@@ -3425,6 +3426,12 @@ static void *voice_audio_thread_func(void *arg) {
                 vc->playing = false;
                 continue;
             }
+#ifdef _WIN32
+            /* Windows: popen はデフォルトでテキストモード。
+             * PCM も Opus もバイナリデータなので _setmode でバイナリモードに切り替える。
+             * これをしないと 0x1A (Ctrl+Z) のバイトが EOF と誤認されて途中で切断される。*/
+            _setmode(_fileno(fp), _O_BINARY);
+#endif
             LOG_I("パイプ起動成功: %s", cmd);
         }
 

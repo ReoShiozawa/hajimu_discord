@@ -1127,7 +1127,7 @@ static JsonNode *discord_rest(const char *method, const char *endpoint,
             usleep((useconds_t)(wait * 1000000));
             json_free(result); free(result);
             free(resp.data);
-            /* Retry once */
+            /* Retry once — スリープ後は接続が stale になるため FRESH_CONNECT で強制再接続 */
             resp.data = (char *)calloc(1, REST_BUF_INIT);
             if (!resp.data) {
                 pthread_mutex_unlock(&g_bot.rest_mutex);
@@ -1145,6 +1145,10 @@ static JsonNode *discord_rest(const char *method, const char *endpoint,
             curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
             curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
             curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+            curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, 1L);
+#ifdef _WIN32
+            curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, (long)CURLSSLOPT_NATIVE_CA);
+#endif
             if (strcmp(method, "POST") == 0) {
                 curl_easy_setopt(curl, CURLOPT_POST, 1L);
                 curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body ? body : "");
@@ -1163,6 +1167,57 @@ static JsonNode *discord_rest(const char *method, const char *endpoint,
             curl_slist_free_all(hdrs);
             if (http_code) *http_code = code;
             result = (res == CURLE_OK && resp.data) ? json_parse(resp.data) : NULL;
+        }
+    } else if (res == CURLE_SEND_ERROR || res == CURLE_RECV_ERROR) {
+        /* サーバー側が keep-alive 接続を閉じていた (stale connection)。
+         * FRESH_CONNECT で再接続して1回だけリトライする。*/
+        LOG_W("REST 接続エラー (%s)、再接続してリトライします", curl_easy_strerror(res));
+        free(resp.data);
+        resp.data = (char *)calloc(1, REST_BUF_INIT);
+        if (!resp.data) {
+            pthread_mutex_unlock(&g_bot.rest_mutex);
+            return NULL;
+        }
+        resp.len = 0;
+        hdrs = NULL;
+        hdrs = curl_slist_append(hdrs, auth);
+        hdrs = curl_slist_append(hdrs, "Content-Type: application/json");
+        hdrs = curl_slist_append(hdrs, DISCORD_USER_AGENT);
+        curl_easy_reset(curl);
+        curl_easy_setopt(curl, CURLOPT_URL, url);
+        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, hdrs);
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_cb);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+        curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, 1L);
+#ifdef _WIN32
+        curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, (long)CURLSSLOPT_NATIVE_CA);
+#endif
+        if (strcmp(method, "POST") == 0) {
+            curl_easy_setopt(curl, CURLOPT_POST, 1L);
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body ? body : "");
+        } else if (strcmp(method, "PUT") == 0) {
+            curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body ? body : "");
+        } else if (strcmp(method, "PATCH") == 0) {
+            curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PATCH");
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body ? body : "");
+        } else if (strcmp(method, "DELETE") == 0) {
+            curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+            if (body) curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body);
+        }
+        res = curl_easy_perform(curl);
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+        curl_slist_free_all(hdrs);
+        if (http_code) *http_code = code;
+        if (res == CURLE_OK && resp.data && resp.len > 0) {
+            result = json_parse(resp.data);
+        } else if (res != CURLE_OK) {
+            LOG_E("REST APIエラー (リトライ失敗): %s", curl_easy_strerror(res));
+            Value err_msg = hajimu_string(curl_easy_strerror(res));
+            event_fire("エラー", 1, &err_msg);
+            event_fire("ERROR", 1, &err_msg);
         }
     } else if (res != CURLE_OK) {
         LOG_E("REST APIエラー: %s", curl_easy_strerror(res));

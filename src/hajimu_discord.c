@@ -3399,11 +3399,20 @@ static void *voice_audio_thread_func(void *arg) {
             if (is_youtube_url(filepath)) {
                 /* YouTube/streaming: yt-dlp → ffmpeg pipe */
                 LOG_I("yt-dlp経由で再生: %s", filepath);
+#ifdef _WIN32
+                /* Windows: /tmp/ は存在しないため stderr を NUL に捨てる */
+                snprintf(cmd, sizeof(cmd),
+                    "yt-dlp -o - -f bestaudio --no-playlist --no-warnings %s \"%s\" 2>NUL | "
+                    "ffmpeg -i pipe:0 -f s16le -ar %d -ac %d -loglevel quiet -",
+                    g_bot.ytdlp_cookie_opt[0] ? g_bot.ytdlp_cookie_opt : "",
+                    filepath, VOICE_SAMPLE_RATE, VOICE_CHANNELS);
+#else
                 snprintf(cmd, sizeof(cmd),
                     "yt-dlp -o - -f bestaudio --no-playlist --no-warnings %s \"%s\" 2>/tmp/hajimu_ytdlp_err.log | "
                     "ffmpeg -i pipe:0 -f s16le -ar %d -ac %d -loglevel quiet -",
                     g_bot.ytdlp_cookie_opt[0] ? g_bot.ytdlp_cookie_opt : "",
                     filepath, VOICE_SAMPLE_RATE, VOICE_CHANNELS);
+#endif
             } else {
                 /* Local file or direct URL: ffmpeg only */
                 snprintf(cmd, sizeof(cmd),
@@ -3454,6 +3463,7 @@ static void *voice_audio_thread_func(void *arg) {
                 if (vc->rtp_seq == 0) {
                     LOG_E("音声データが取得できませんでした (seq=0)");
                     /* Read yt-dlp error log */
+#ifndef _WIN32
                     FILE *errf = fopen("/tmp/hajimu_ytdlp_err.log", "r");
                     if (errf) {
                         char errbuf[512];
@@ -3465,6 +3475,9 @@ static void *voice_audio_thread_func(void *arg) {
                         }
                         fclose(errf);
                     }
+#else
+                    LOG_E("yt-dlp/ffmpegのステータスを確認: yt-dlp と ffmpeg が PATH に存在するか確認してください");
+#endif
                 } else {
                     LOG_I("音声データ読み取り完了 (EOF, seq=%u)", vc->rtp_seq);
                 }

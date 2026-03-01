@@ -71,14 +71,15 @@
   #define usleep usleep_compat
   #define close(fd) closesocket(fd)
   typedef int socklen_t;
-  /* Windows の SO_RCVTIMEO/SO_SNDTIMEO は DWORD (ms 単位) で指定する */
-  static inline void sock_set_timeout(int sock, int ms) {
-    DWORD ms_dw = (DWORD)ms;
+  /* Windows の SO_RCVTIMEO/SO_SNDTIMEO は DWORD (ms 単位) で指定する。
+   * 呼び出し側は POSIX に合わせて秒単位で渡すため、内部で × 1000 する。*/
+  static inline void sock_set_timeout(int sock, int sec) {
+    DWORD ms_dw = (DWORD)(sec * 1000);
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&ms_dw, sizeof(ms_dw));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, (const char*)&ms_dw, sizeof(ms_dw));
   }
-  static inline void sock_set_rcvtimeo(int sock, int ms) {
-    DWORD ms_dw = (DWORD)ms;
+  static inline void sock_set_rcvtimeo(int sock, int sec) {
+    DWORD ms_dw = (DWORD)(sec * 1000);
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, (const char*)&ms_dw, sizeof(ms_dw));
   }
   static inline int win_setenv(const char *key, const char *val, int overwrite) {

@@ -6,6 +6,8 @@
 PLUGIN_NAME = hajimu_discord
 OUT         = $(PLUGIN_NAME).hjp
 
+.DEFAULT_GOAL := all
+
 # ソース
 SRC = src/hajimu_discord.c
 

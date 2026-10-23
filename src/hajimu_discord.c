@@ -159,7 +159,7 @@ static int load_windows_ca_store(SSL_CTX *ctx) {
  * ========================================================================= */
 
 #define PLUGIN_NAME    "hajimu_discord"
-#define PLUGIN_VERSION "2.3.0"
+#define PLUGIN_VERSION "2.3.1"
 
 /* User-Agent (version auto-embedded) */
 #define DISCORD_USER_AGENT "User-Agent: DiscordBot (hajimu_discord, " PLUGIN_VERSION ")"
@@ -9895,6 +9895,8 @@ static HajimuPluginFunc functions[] = {
     {"env読み込み",               fn_env_load,                  0,  1},
     {"env取得",                   fn_env_get,                   1,  2},
 };
+
+HAJIMU_PLUGIN_ABI_EXPORT()
 
 HAJIMU_PLUGIN_EXPORT HajimuPluginInfo *hajimu_plugin_init(void) {
     static HajimuPluginInfo info = {
